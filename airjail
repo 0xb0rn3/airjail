@@ -279,6 +279,98 @@ def get_local_subnet():
         pass
     return "192.168.1.0/24"
 
+def pick_interface():
+    """Show a numbered interface selection menu and return chosen iface name."""
+    clear(); banner()
+    console.print("[bold cyan]── Select Network Interface ──[/]\n")
+
+    # gather all interfaces with metadata
+    raw_ifaces = []
+    try:
+        out = subprocess.check_output(["ip", "-o", "link", "show"], text=True)
+        for line in out.splitlines():
+            parts  = line.split()
+            idx    = parts[0].rstrip(":")
+            name   = parts[1].rstrip(":")
+            # skip loopback
+            if name == "lo":
+                continue
+            # get IP if any
+            try:
+                ip_out = subprocess.check_output(
+                    ["ip", "-o", "-f", "inet", "addr", "show", name], text=True)
+                m = re.search(r"(\d+\.\d+\.\d+\.\d+/\d+)", ip_out)
+                ip_addr = m.group(1) if m else "no IP"
+            except Exception:
+                ip_addr = "no IP"
+            # get state
+            state_m = re.search(r"state (\S+)", line)
+            state   = state_m.group(1) if state_m else "UNKNOWN"
+            # get MAC
+            mac_m   = re.search(r"link/\S+ ([0-9a-f:]{17})", line)
+            mac     = mac_m.group(1) if mac_m else "—"
+            # is wireless?
+            is_wifi = os.path.exists(f"/sys/class/net/{name}/wireless")
+            kind    = "[cyan]WiFi[/]" if is_wifi else "[dim]LAN [/]"
+
+            raw_ifaces.append({
+                "name": name, "ip": ip_addr, "mac": mac,
+                "state": state, "kind": kind
+            })
+    except Exception:
+        # fallback: scapy list
+        names = get_if_list() if SCAPY_OK else []
+        raw_ifaces = [{"name": n, "ip": "—", "mac": "—",
+                       "state": "?", "kind": "[dim]—[/]"} for n in names if n != "lo"]
+
+    if not raw_ifaces:
+        console.print("[yellow]No interfaces found. Enter manually.[/]")
+        return Prompt.ask("[cyan]Interface name[/]", default="wlan0")
+
+    table = Table(box=box.ROUNDED, border_style="cyan", show_lines=True)
+    table.add_column("#",       style="bold yellow", width=4, justify="right")
+    table.add_column("Name",    style="bold cyan",   width=12)
+    table.add_column("Type",    width=8)
+    table.add_column("IP / Subnet",   style="green",   width=20)
+    table.add_column("MAC",     style="yellow",  width=20)
+    table.add_column("State",   width=10)
+
+    default_name = get_default_iface()
+    for i, iface in enumerate(raw_ifaces, 1):
+        state_color = "[green]" if "UP" in iface["state"] else "[red]"
+        marker      = " [bold yellow]← default[/]" if iface["name"] == default_name else ""
+        table.add_row(
+            str(i),
+            f"{iface['name']}{marker}",
+            iface["kind"],
+            iface["ip"],
+            iface["mac"],
+            f"{state_color}{iface['state']}[/]"
+        )
+
+    console.print(table)
+    console.print(f"\n[dim]Default auto-detected: [cyan]{default_name}[/][/]\n")
+
+    while True:
+        choice = Prompt.ask(
+            "[bold cyan]Select interface #[/] [dim](or type name directly)[/]"
+        ).strip()
+
+        if choice.isdigit():
+            idx = int(choice)
+            if 1 <= idx <= len(raw_ifaces):
+                selected = raw_ifaces[idx - 1]["name"]
+                console.print(f"\n[green][✓] Interface set → [bold]{selected}[/bold][/]")
+                time.sleep(0.6)
+                return selected
+            else:
+                console.print(f"[red]Enter a number between 1 and {len(raw_ifaces)}[/]")
+        elif choice:
+            # typed name directly
+            console.print(f"\n[green][✓] Interface set → [bold]{choice}[/bold][/]")
+            time.sleep(0.6)
+            return choice
+
 def mac_vendor(mac):
     if MANUF_OK:
         try:
@@ -731,12 +823,12 @@ def menu_firewall():
 
 def menu_setup():
     global IFACE, GATEWAY_IP, GATEWAY_MAC, REDIRECT_IP, REDIRECT_PORT
+
+    IFACE = pick_interface()
+
     clear(); banner()
     console.print("[bold cyan]── Setup ──[/]\n")
-
-    ifaces = get_if_list() if SCAPY_OK else []
-    console.print("[cyan]Interfaces:[/] " + "  ".join(ifaces))
-    IFACE = Prompt.ask("[cyan]LAN interface[/]", default=get_default_iface())
+    console.print(f"[green][✓] Interface: [bold]{IFACE}[/bold][/]\n")
 
     with console.status("[cyan]Detecting gateway..."):
         GATEWAY_IP, GATEWAY_MAC = get_gateway()
@@ -774,10 +866,6 @@ def menu_setup():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main_menu():
-    global IFACE
-    if not IFACE:
-        IFACE = get_default_iface()
-
     clear(); banner()
 
     rows = [
@@ -815,6 +903,28 @@ def main_menu():
     return Prompt.ask("\n[bold cyan]airjail >[/]").strip().upper()
 
 def run():
+    global IFACE, GATEWAY_IP, GATEWAY_MAC
+
+    # ── first-run interface selection ────────────────────────────────────────
+    IFACE = pick_interface()
+    clear(); banner()
+    with console.status(f"[cyan]Auto-detecting gateway on {IFACE}..."):
+        GATEWAY_IP, GATEWAY_MAC = get_gateway()
+    if GATEWAY_IP:
+        console.print(f"[green][✓] Gateway: [bold]{GATEWAY_IP}[/bold]  MAC: {GATEWAY_MAC}[/]")
+    else:
+        console.print(f"[yellow][!] Could not auto-detect gateway.[/]")
+        GATEWAY_IP  = Prompt.ask("[cyan]Enter gateway IP[/]", default="192.168.1.1")
+        GATEWAY_MAC = Prompt.ask("[cyan]Enter gateway MAC[/]", default="")
+    if SCAPY_OK:
+        start_dns_monitor()
+        console.print(f"[green][✓] DNS monitor started on {IFACE}[/]")
+    subprocess.run(["sysctl","-w","net.ipv4.ip_forward=1"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    console.print("[green][✓] IP forwarding enabled.[/]")
+    time.sleep(1)
+    # ────────────────────────────────────────────────────────────────────────
+
     handlers = {
         "1": menu_scan,
         "2": menu_device_lookup,
