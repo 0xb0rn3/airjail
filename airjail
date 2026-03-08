@@ -1,0 +1,1583 @@
+#!/usr/bin/env python3
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#   █████╗ ██╗██████╗      ██╗ █████╗ ██╗██╗
+#  ██╔══██╗██║██╔══██╗     ██║██╔══██╗██║██║
+#  ███████║██║██████╔╝     ██║███████║██║██║
+#  ██╔══██║██║██╔══██╗██   ██║██╔══██║██║██║
+#  ██║  ██║██║██║  ██║╚█████╔╝██║  ██║██║███████╗
+#  ╚═╝  ╚═╝╚═╝╚═╝  ╚═╝ ╚════╝ ╚═╝  ╚═╝╚═╝╚══════╝
+#
+#  WiFi Network Manager & Abuse Control
+#  dev: 0xb0rn3 | oxbv1
+#  github: https://github.com/0xb0rn3/airjail
+#  version: 1.3.0
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+import os
+import sys
+import subprocess
+import platform
+import shutil
+import time
+import threading
+import socket
+import re
+import json
+from datetime import datetime, timedelta
+import glob
+from collections import defaultdict
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 0 — CROSS-DISTRO AUTO INSTALLER
+#  Runs before any import so missing deps are fixed silently first.
+# ══════════════════════════════════════════════════════════════════════════════
+
+VERSION    = "1.3.0"
+REPO_URL   = "https://github.com/0xb0rn3/airjail"
+
+# ── system packages needed per distro ────────────────────────────────────────
+_SYS_PKGS = {
+    # pkg-manager  : list of package names
+    "pacman" : ["python-pip", "python-scapy", "nmap", "net-tools",
+                 "aircrack-ng", "iptables", "iw", "wireless_tools"],
+    "apt"    : ["python3-pip", "python3-scapy", "nmap", "net-tools",
+                 "aircrack-ng", "iptables", "iw", "wireless-tools",
+                 "libpcap-dev"],
+    "dnf"    : ["python3-pip", "nmap", "net-tools", "aircrack-ng",
+                 "iptables", "iw", "wireless-tools", "libpcap-devel"],
+}
+
+# ── python packages needed ────────────────────────────────────────────────────
+_PY_PKGS = ["rich", "scapy", "requests", "manuf"]
+
+# ── detect distro ─────────────────────────────────────────────────────────────
+def _detect_pm():
+    for pm in ("pacman", "apt", "dnf"):
+        if shutil.which(pm):
+            return pm
+    return None
+
+def _distro_name():
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                if line.startswith("NAME="):
+                    return line.split("=")[1].strip().strip('"')
+    except Exception:
+        pass
+    return platform.system()
+
+# ── pretty spinner for installs ───────────────────────────────────────────────
+class _Spinner:
+    _frames = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
+
+    def __init__(self, msg):
+        self.msg   = msg
+        self._stop = threading.Event()
+        self._t    = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self):
+        i = 0
+        while not self._stop.is_set():
+            print(f"\r\033[36m{self._frames[i % len(self._frames)]}\033[0m {self.msg}", end="", flush=True)
+            time.sleep(0.08)
+            i += 1
+
+    def start(self): self._t.start(); return self
+    def stop(self, ok=True):
+        self._stop.set()
+        sym = "\033[32m✓\033[0m" if ok else "\033[31m✗\033[0m"
+        print(f"\r{sym} {self.msg}       ")
+
+# ── install system packages ───────────────────────────────────────────────────
+def _install_sys_pkgs(pm, pkgs):
+    if pm == "pacman":
+        cmd = ["pacman", "-S", "--noconfirm", "--needed"] + pkgs
+    elif pm == "apt":
+        subprocess.run(["apt", "update", "-qq"], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        cmd = ["apt", "install", "-y", "-qq"] + pkgs
+    elif pm == "dnf":
+        cmd = ["dnf", "install", "-y", "-q"] + pkgs
+    else:
+        return False
+
+    sp = _Spinner(f"Installing system packages via {pm}...").start()
+    r  = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    sp.stop(r.returncode == 0)
+    return r.returncode == 0
+
+# ── install python packages ───────────────────────────────────────────────────
+def _install_py_pkg(pkg):
+    flags = ["--break-system-packages"] if _detect_pm() in ("apt", "dnf") else []
+    r = subprocess.run(
+        [sys.executable, "-m", "pip", "install", pkg, "-q"] + flags,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    return r.returncode == 0
+
+# ── main bootstrap entry point ────────────────────────────────────────────────
+def bootstrap():
+    missing_sys = []
+    missing_py  = []
+
+    # check python packages
+    for pkg in _PY_PKGS:
+        try:
+            __import__(pkg.split("[")[0])
+        except ImportError:
+            missing_py.append(pkg)
+
+    # check system tools
+    for tool in ("nmap", "airmon-ng", "iptables", "iw"):
+        if not shutil.which(tool):
+            missing_sys.append(tool)
+
+    if not missing_py and not missing_sys:
+        return   # all good, silent
+
+    pm      = _detect_pm()
+    distro  = _distro_name()
+
+    print("\033[1;36m")
+    print("  ╔══════════════════════════════════════════╗")
+    print("  ║        airjail — dependency check        ║")
+    print("  ╚══════════════════════════════════════════╝\033[0m")
+    print(f"\033[33m  Distro : {distro}")
+    print(f"  PM     : {pm or 'not detected'}\033[0m\n")
+
+    if missing_sys:
+        print(f"\033[33m  Missing system tools: {', '.join(missing_sys)}\033[0m")
+        if pm:
+            pkgs = _SYS_PKGS.get(pm, [])
+            _install_sys_pkgs(pm, pkgs)
+        else:
+            print("\033[31m  Could not detect package manager. Install manually:\033[0m")
+            print("  Arch  : sudo pacman -S aircrack-ng nmap net-tools iptables iw")
+            print("  Debian: sudo apt install aircrack-ng nmap net-tools iptables iw")
+            print("  Fedora: sudo dnf install aircrack-ng nmap net-tools iptables iw\n")
+
+    if missing_py:
+        for pkg in missing_py:
+            sp = _Spinner(f"pip install {pkg}").start()
+            ok = _install_py_pkg(pkg)
+            sp.stop(ok)
+            if not ok:
+                print(f"\033[31m  Failed to install {pkg}. Try: pip install {pkg} --break-system-packages\033[0m")
+
+    print()
+
+# run bootstrap before any rich/scapy imports
+if os.geteuid() != 0:
+    print("\033[1;31m[-] airjail must run as root → sudo python3 airjail.py\033[0m")
+    sys.exit(1)
+
+bootstrap()
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 1 — IMPORTS (safe after bootstrap)
+# ══════════════════════════════════════════════════════════════════════════════
+
+from rich.console import Console
+from rich.table   import Table
+from rich.live    import Live
+from rich.panel   import Panel
+from rich.prompt  import Prompt, Confirm
+from rich         import box
+from rich.markup  import escape
+import requests
+
+try:
+    from scapy.all import (ARP, Ether, srp, sendp, send, sniff,
+                            IP, TCP, UDP, DNS, DNSQR, conf, get_if_list)
+    from scapy.layers.dot11 import Dot11, Dot11Deauth, RadioTap
+    SCAPY_OK = True
+except Exception:
+    SCAPY_OK = False
+
+try:
+    import manuf
+    MANUF_OK = True
+except Exception:
+    MANUF_OK = False
+
+console = Console()
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 2 — GLOBALS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── USB adapter state (populated by detect_usb_adapter()) ────────────────────
+ADAPTER_USB_ID   = None
+ADAPTER_CHIPSET  = None
+ADAPTER_VENDOR   = None
+ADAPTER_DRIVER   = None
+ADAPTER_INSTALL  = None
+ADAPTER_LED      = False   # True only for MT76-family adapters
+
+JAILED       = {}                                  # mac  → {ip, reason, time}
+BW_STATS     = defaultdict(lambda: {"rx":0,"tx":0})
+DNS_LOG      = defaultdict(list)                   # mac  → [domains]
+REDIRECT_IP  = None
+REDIRECT_PORT= 80
+IFACE        = None
+GATEWAY_IP   = None
+GATEWAY_MAC  = None
+_stop_events = {}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 2.5 — USB ADAPTER ENGINE
+#  · Adapter database  (USB ID → chipset / driver / install method / LED flag)
+#  · LEDEngine class   (MT76 debugfs register control + dramatic patterns)
+#  · detect_usb_adapter()  — scan lsusb against DB, populate globals
+#  · install_adapter_driver() — per-chipset driver installation
+#  · menu_adapter()    — interactive adapter info / driver / LED panel
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Adapter database ──────────────────────────────────────────────────────────
+# Each entry: usb_id → (chipset, vendor_hint, kernel_module, install_method, led)
+#   install_method: "kernel" | "morrownr_7612u" | "rtl8812au" | "rtl8812bu"
+#                   "rtl8814au" | "rtl8821cu" | "ath9k_htc"
+ADAPTER_DB: dict = {
+    # ── MediaTek MT7612U — AC1200/AC1300, MU-MIMO, dual-band ──────────────
+    "0e8d:7612": ("MT7612U",  "Comfast/MediaTek",  "mt76x2u",   "morrownr_7612u", True),
+    "0e8d:7632": ("MT7612U",  "Comfast",            "mt76x2u",   "morrownr_7612u", True),
+    "0e8d:7662": ("MT7612U",  "Comfast MU-MIMO",    "mt76x2u",   "morrownr_7612u", True),
+    "7392:b711": ("MT7612U",  "Edimax EW-7822UAC",  "mt76x2u",   "morrownr_7612u", True),
+    "0846:9053": ("MT7612U",  "Netgear A6210",       "mt76x2u",   "morrownr_7612u", True),
+    "2357:010c": ("MT7612U",  "TP-Link T4U v1",      "mt76x2u",   "morrownr_7612u", True),
+    "2357:0105": ("MT7612U",  "TP-Link T2U Plus",    "mt76x2u",   "morrownr_7612u", True),
+    "2001:3a10": ("MT7612U",  "D-Link DWA-182 C1",   "mt76x2u",   "morrownr_7612u", True),
+    "20f4:806b": ("MT7612U",  "TRENDnet TEW-805UB",  "mt76x2u",   "morrownr_7612u", True),
+    "13b1:003e": ("MT7612U",  "Linksys WUSB6300",    "mt76x2u",   "morrownr_7612u", True),
+    "0e8d:7650": ("MT7612U",  "Generic MT7612U",     "mt76x2u",   "morrownr_7612u", True),
+    # ── MediaTek MT7610U — AC600 ───────────────────────────────────────────
+    "0e8d:7610": ("MT7610U",  "MediaTek",            "mt76x0u",   "kernel",         True),
+    "148f:761a": ("MT7610U",  "Ralink",              "mt76x0u",   "kernel",         True),
+    "2357:0103": ("MT7610U",  "TP-Link T1U",         "mt76x0u",   "kernel",         True),
+    # ── MediaTek MT7601U — N150 single-band ───────────────────────────────
+    "0e8d:7601": ("MT7601U",  "MediaTek",            "mt7601u",   "kernel",         False),
+    "148f:7601": ("MT7601U",  "Ralink",              "mt7601u",   "kernel",         False),
+    "2357:010e": ("MT7601U",  "TP-Link WN727N",      "mt7601u",   "kernel",         False),
+    # ── MediaTek MT7921U/7922U — WiFi 6 ───────────────────────────────────
+    "0e8d:7961": ("MT7921U",  "MediaTek",            "mt7921u",   "kernel",         False),
+    "13b1:0043": ("MT7921U",  "Linksys WUSB6400M",   "mt7921u",   "kernel",         False),
+    "0e8d:7922": ("MT7922U",  "MediaTek",            "mt7921u",   "kernel",         False),
+    # ── Ralink RT3070 / RT5370 / RT5572 ───────────────────────────────────
+    "148f:5370": ("RT5370",   "Ralink",              "rt2800usb", "kernel",         False),
+    "148f:5372": ("RT5370",   "Ralink",              "rt2800usb", "kernel",         False),
+    "148f:3070": ("RT3070",   "Ralink",              "rt2800usb", "kernel",         False),
+    "148f:3072": ("RT3072",   "Ralink",              "rt2800usb", "kernel",         False),
+    "148f:3573": ("RT3573",   "Ralink",              "rt2800usb", "kernel",         False),
+    "148f:5572": ("RT5572",   "Ralink dual-band",    "rt2800usb", "kernel",         False),
+    # ── Realtek RTL8812AU — AC1200 ────────────────────────────────────────
+    "0bda:8812": ("RTL8812AU","Realtek",             "88XXau",    "rtl8812au",      False),
+    "0bda:881a": ("RTL8812AU","Realtek",             "88XXau",    "rtl8812au",      False),
+    "2357:0101": ("RTL8812AU","TP-Link T4U v1",      "88XXau",    "rtl8812au",      False),
+    "0846:9052": ("RTL8812AU","Netgear A6100",        "88XXau",    "rtl8812au",      False),
+    "7392:a813": ("RTL8812AU","Edimax",              "88XXau",    "rtl8812au",      False),
+    "2001:330d": ("RTL8812AU","D-Link DWA-172",       "88XXau",    "rtl8812au",      False),
+    "050d:1109": ("RTL8812AU","Belkin F9L1109",       "88XXau",    "rtl8812au",      False),
+    "20f4:805b": ("RTL8812AU","TRENDnet",             "88XXau",    "rtl8812au",      False),
+    "13b1:003f": ("RTL8812AU","Linksys WUSB6300 v2",  "88XXau",    "rtl8812au",      False),
+    "2001:3318": ("RTL8812AU","D-Link DWA-182 D1",    "88XXau",    "rtl8812au",      False),
+    "0411:029b": ("RTL8812AU","Buffalo WI-U3-866D",   "88XXau",    "rtl8812au",      False),
+    # ── Realtek RTL8812BU ─────────────────────────────────────────────────
+    "0bda:b812": ("RTL8812BU","Realtek",             "88x2bu",    "rtl8812bu",      False),
+    "2357:012d": ("RTL8812BU","TP-Link T3U Plus",    "88x2bu",    "rtl8812bu",      False),
+    "0bda:b82c": ("RTL8812BU","Realtek",             "88x2bu",    "rtl8812bu",      False),
+    "7392:b822": ("RTL8812BU","Edimax EW-7822UAC",   "88x2bu",    "rtl8812bu",      False),
+    # ── Realtek RTL8814AU — AC1900 ────────────────────────────────────────
+    "0bda:8813": ("RTL8814AU","Realtek",             "8814au",    "rtl8814au",      False),
+    "2001:331a": ("RTL8814AU","D-Link DWA-192",       "8814au",    "rtl8814au",      False),
+    "0846:9055": ("RTL8814AU","Netgear A7000",        "8814au",    "rtl8814au",      False),
+    "2357:0107": ("RTL8814AU","TP-Link T9UH",         "8814au",    "rtl8814au",      False),
+    # ── Realtek RTL8821CU — AC650 ─────────────────────────────────────────
+    "0bda:c811": ("RTL8821CU","Realtek",             "8821cu",    "rtl8821cu",      False),
+    "2357:0115": ("RTL8821CU","TP-Link T2U Nano",    "8821cu",    "rtl8821cu",      False),
+    "7392:c811": ("RTL8821CU","Edimax",              "8821cu",    "rtl8821cu",      False),
+    # ── Realtek RTL8188EU/GU — N150 ───────────────────────────────────────
+    "0bda:f179": ("RTL8188GU","Realtek",             "r8188eu",   "kernel",         False),
+    "0bda:8179": ("RTL8188EU","Realtek",             "r8188eu",   "kernel",         False),
+    # ── Atheros AR9271 / AR9287 ───────────────────────────────────────────
+    "0cf3:9271": ("AR9271",   "Atheros",             "ath9k_htc", "ath9k_htc",      False),
+    "0cf3:7015": ("AR9287",   "Atheros",             "ath9k_htc", "ath9k_htc",      False),
+    "0cf3:1006": ("AR9271",   "Atheros",             "ath9k_htc", "ath9k_htc",      False),
+    "0846:9030": ("AR9271",   "Netgear WNA1100",     "ath9k_htc", "ath9k_htc",      False),
+}
+
+# ── LED Engine ────────────────────────────────────────────────────────────────
+
+class LEDEngine:
+    """
+    MT76 hardware LED control via debugfs register writes.
+
+    Register 0x770 (LED_CFG):
+      0x800000 → ON   |  0x820000 → OFF   |  0x840000 → HW blink
+
+    Requires:
+      - mt76x2u (or mt76x0u) loaded
+      - debugfs mounted at /sys/kernel/debug
+      - root privileges (already required by airjail)
+    """
+
+    LED_ON  = "0x800000"
+    LED_OFF = "0x820000"
+    LED_HW  = "0x840000"
+    REGIDX  = "0x770"
+
+    def __init__(self):
+        self.phy_path:  str | None       = None
+        self._enabled:  bool             = False
+        self._bkg_thread: threading.Thread | None = None
+        self._bkg_stop:   threading.Event          = threading.Event()
+        self._init()
+
+    def _init(self):
+        """Mount debugfs if needed, then locate the MT76 PHY directory."""
+        if not os.path.isdir("/sys/kernel/debug/ieee80211"):
+            subprocess.run(["mount", "-t", "debugfs", "none", "/sys/kernel/debug"],
+                           stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        paths = glob.glob("/sys/kernel/debug/ieee80211/phy*/mt76")
+        for p in paths:
+            if os.path.isdir(p):
+                self.phy_path = p
+                self._enabled = True
+                return
+
+    def refresh(self):
+        """Re-scan for PHY path (call after driver load)."""
+        self.phy_path = None
+        self._enabled = False
+        self._init()
+
+    def _write(self, val: str):
+        if not self._enabled or not self.phy_path:
+            return
+        try:
+            with open(f"{self.phy_path}/regidx", "w") as f:
+                f.write(self.REGIDX + "\n")
+            with open(f"{self.phy_path}/regval", "w") as f:
+                f.write(val + "\n")
+        except Exception:
+            pass
+
+    def on(self):       self._write(self.LED_ON)
+    def off(self):      self._write(self.LED_OFF)
+    def hw_blink(self): self._write(self.LED_HW)
+
+    def blink(self, count: int = 3, on_ms: int = 150, off_ms: int = 150):
+        for _ in range(count):
+            self.on();  time.sleep(on_ms  / 1000)
+            self.off(); time.sleep(off_ms / 1000)
+
+    def _stop_bkg(self):
+        self._bkg_stop.set()
+        if self._bkg_thread and self._bkg_thread.is_alive():
+            self._bkg_thread.join(timeout=2)
+        self._bkg_stop.clear()
+        self._bkg_thread = None
+
+    # ── Named patterns (each fires in a daemon thread to avoid blocking UI) ──
+
+    def boot_sequence(self):
+        """Rapid triple-flash → breathing ramp-up → solid ON."""
+        if not self._enabled: return
+        def _run():
+            self.blink(3, 80, 80)
+            time.sleep(0.2)
+            for d in [0.05, 0.10, 0.18, 0.28, 0.40]:
+                self.on();  time.sleep(d)
+                self.off(); time.sleep(0.06)
+            time.sleep(0.1)
+            self.on()
+        threading.Thread(target=_run, daemon=True).start()
+
+    def scan_pulse(self):
+        """Double sonar-ping × 6 — played during interface/adapter detection."""
+        if not self._enabled: return
+        def _run():
+            for _ in range(6):
+                self.on();  time.sleep(0.08)
+                self.off(); time.sleep(0.08)
+                self.on();  time.sleep(0.08)
+                self.off(); time.sleep(0.45)
+        threading.Thread(target=_run, daemon=True).start()
+
+    def success(self):
+        """5 rapid + 3 medium flashes → solid ON."""
+        if not self._enabled: return
+        self._stop_bkg()
+        def _run():
+            self.blink(5, 60, 60)
+            time.sleep(0.1)
+            self.blink(3, 120, 80)
+            time.sleep(0.15)
+            self.on()
+        threading.Thread(target=_run, daemon=True).start()
+
+    def error(self):
+        """SOS morse pattern: ··· — — — ···"""
+        if not self._enabled: return
+        self._stop_bkg()
+        def _run():
+            self.blink(3, 100, 100)   # S
+            time.sleep(0.2)
+            self.blink(3, 400, 150)   # O
+            time.sleep(0.2)
+            self.blink(3, 100, 100)   # S
+            time.sleep(0.4)
+            self.off()
+        threading.Thread(target=_run, daemon=True).start()
+
+    def install_start(self):
+        """Slow single-pulse loop in background — runs during driver install."""
+        if not self._enabled: return
+        self._stop_bkg()
+        def _loop():
+            while not self._bkg_stop.is_set():
+                self.on();  time.sleep(0.12)
+                self.off(); time.sleep(0.68)
+        self._bkg_thread = threading.Thread(target=_loop, daemon=True)
+        self._bkg_thread.start()
+
+    def install_stop(self):
+        """Stop install-progress loop."""
+        self._stop_bkg()
+        self.off()
+
+    def mitm_alert(self):
+        """Fast double-strobe × 8 → hardware blink — active threat indicator."""
+        if not self._enabled: return
+        self._stop_bkg()
+        def _run():
+            for _ in range(8):
+                self.on();  time.sleep(0.04)
+                self.off(); time.sleep(0.04)
+                self.on();  time.sleep(0.04)
+                self.off(); time.sleep(0.18)
+            self.hw_blink()
+        threading.Thread(target=_run, daemon=True).start()
+
+    def deauth_blast(self):
+        """Machine-gun × 15 rapid blinks — packet bombardment burst."""
+        if not self._enabled: return
+        threading.Thread(target=lambda: self.blink(15, 40, 40), daemon=True).start()
+
+    def jail_flash(self):
+        """Aggressive triple-flash when a device is jailed/redirected."""
+        if not self._enabled: return
+        threading.Thread(target=lambda: self.blink(3, 80, 60), daemon=True).start()
+
+    def unjail_pulse(self):
+        """Gentle double long-pulse when a device is released."""
+        if not self._enabled: return
+        def _run():
+            self.on(); time.sleep(0.30); self.off(); time.sleep(0.10)
+            self.on(); time.sleep(0.30); self.off()
+        threading.Thread(target=_run, daemon=True).start()
+
+    def dns_start(self):
+        """Quick double-blink to signal DNS spy activated."""
+        if not self._enabled: return
+        threading.Thread(target=lambda: self.blink(2, 120, 80), daemon=True).start()
+
+    def monitor_start(self):
+        """Slow heartbeat loop in background — 'listening' mode indicator."""
+        if not self._enabled: return
+        self._stop_bkg()
+        def _loop():
+            while not self._bkg_stop.is_set():
+                self.on();  time.sleep(0.18)
+                self.off(); time.sleep(0.08)
+                self.on();  time.sleep(0.06)
+                self.off(); time.sleep(1.20)
+        self._bkg_thread = threading.Thread(target=_loop, daemon=True)
+        self._bkg_thread.start()
+
+    def monitor_stop(self):
+        """Stop heartbeat loop."""
+        self._stop_bkg()
+        self.off()
+
+
+# Singleton LED instance — used throughout airjail
+LED = LEDEngine()
+
+
+# ── Adapter detection ─────────────────────────────────────────────────────────
+
+def detect_usb_adapter(silent: bool = False) -> dict | None:
+    """
+    Scan `lsusb` output against ADAPTER_DB.
+    Populates the ADAPTER_* globals and wires up LED if the adapter supports it.
+    Returns a dict with adapter info, or None if nothing matched.
+    """
+    global ADAPTER_USB_ID, ADAPTER_CHIPSET, ADAPTER_VENDOR
+    global ADAPTER_DRIVER, ADAPTER_INSTALL, ADAPTER_LED
+
+    try:
+        usb_out = subprocess.check_output(["lsusb"], text=True,
+                                          stderr=subprocess.DEVNULL)
+    except Exception:
+        if not silent:
+            pass  # lsusb not available — skip silently
+        return None
+
+    for usb_id, info in ADAPTER_DB.items():
+        if usb_id.lower() in usb_out.lower():
+            chipset, vendor, driver, method, led = info
+            ADAPTER_USB_ID  = usb_id
+            ADAPTER_CHIPSET = chipset
+            ADAPTER_VENDOR  = vendor
+            ADAPTER_DRIVER  = driver
+            ADAPTER_INSTALL = method
+            ADAPTER_LED     = led
+            # Re-init LED engine now that we know LED capability
+            if led:
+                LED.refresh()
+            return {
+                "usb_id": usb_id, "chipset": chipset, "vendor": vendor,
+                "driver": driver, "method": method, "led": led,
+                "lsusb_line": next(
+                    (l for l in usb_out.splitlines() if usb_id.lower() in l.lower()),
+                    "—"
+                ),
+            }
+
+    # Fuzzy fallback: detect any known vendor prefix
+    for prefix, (chipset, vendor) in {
+        "0e8d:": ("MT76xx", "MediaTek"),
+        "0bda:": ("Realtek", "Realtek"),
+        "148f:": ("Ralink/MT", "Ralink"),
+        "0cf3:": ("AR9xxx", "Atheros"),
+    }.items():
+        if prefix in usb_out.lower():
+            if not silent:
+                pass
+            ADAPTER_CHIPSET = chipset
+            ADAPTER_VENDOR  = vendor
+            ADAPTER_LED     = False
+            return {
+                "usb_id": f"{prefix}????", "chipset": chipset,
+                "vendor": vendor, "driver": "unknown",
+                "method": "unknown", "led": False,
+                "lsusb_line": "unknown — USB ID not in database",
+            }
+
+    return None
+
+
+# ── Driver installation ───────────────────────────────────────────────────────
+
+def _git_dkms(repo_url: str, dir_name: str, script: str = "install-driver.sh") -> bool:
+    """Clone repo into /tmp and run its DKMS install script."""
+    build = f"/tmp/airjail_drv_{dir_name}"
+    try:
+        if os.path.isdir(build):
+            subprocess.run(["rm", "-rf", build], check=False)
+        subprocess.run(["git", "clone", "--depth=1", repo_url, build], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        inst = os.path.join(build, script)
+        os.chmod(inst, 0o755)
+        subprocess.run(["sudo", inst], check=True, cwd=build)
+        subprocess.run(["rm", "-rf", build], check=False)
+        return True
+    except Exception as e:
+        return False
+
+def _modprobe(module: str, deps: list | None = None) -> bool:
+    """Load kernel module (and optional dependencies)."""
+    for m in (deps or []) + [module]:
+        subprocess.run(["sudo", "modprobe", m],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(1)
+    try:
+        out = subprocess.check_output(["lsmod"], text=True)
+        return module in out
+    except Exception:
+        return False
+
+def install_adapter_driver(console_obj) -> bool:
+    """
+    Install the driver for the currently detected adapter.
+    Uses ADAPTER_INSTALL to dispatch to the correct method.
+    Drives the LED install-progress pattern during the build.
+    """
+    if not ADAPTER_INSTALL:
+        console_obj.print("[red]No adapter detected — run detection first.[/]")
+        return False
+
+    method = ADAPTER_INSTALL
+    driver = ADAPTER_DRIVER or ""
+
+    LED.install_start()
+
+    ok = False
+    try:
+        if method == "kernel":
+            dep_map = {
+                "mt76x2u":   ["mt76x2_common", "mt76_usb", "mt76"],
+                "mt76x0u":   ["mt76x0_common", "mt76_usb", "mt76"],
+                "mt7921u":   ["mt7921_common",  "mt76_connac_lib", "mt76_usb", "mt76"],
+                "rt2800usb": ["rt2800lib", "rt2x00usb", "rt2x00lib"],
+                "ath9k_htc": ["ath9k_common", "ath"],
+                "r8188eu":   [],
+                "mt7601u":   [],
+            }
+            deps = dep_map.get(driver, [])
+            ok = _modprobe(driver, deps)
+
+        elif method == "morrownr_7612u":
+            # Try in-kernel first (Linux 4.19+)
+            if _modprobe("mt76x2u", ["mt76x2_common", "mt76_usb", "mt76"]):
+                ok = True
+            else:
+                console_obj.print("[yellow]  In-kernel mt76x2u unavailable — building from source...[/]")
+                ok = _git_dkms("https://github.com/morrownr/7612u.git", "7612u")
+
+        elif method == "rtl8812au":
+            ok = _git_dkms("https://github.com/aircrack-ng/rtl8812au.git", "rtl8812au")
+
+        elif method == "rtl8812bu":
+            ok = _git_dkms("https://github.com/morrownr/88x2bu-20210629.git", "88x2bu")
+
+        elif method == "rtl8814au":
+            ok = _git_dkms("https://github.com/morrownr/8814au.git", "8814au")
+
+        elif method == "rtl8821cu":
+            ok = _git_dkms("https://github.com/morrownr/8821cu-20210118.git", "8821cu")
+
+        elif method == "ath9k_htc":
+            # Install firmware package then modprobe
+            pm = _detect_pm()
+            fw_pkg = {
+                "apt": "firmware-atheros", "pacman": "linux-firmware",
+                "dnf": "linux-firmware",
+            }.get(pm, "linux-firmware")
+            subprocess.run(["sudo", pm, "install", "-y", fw_pkg],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            ok = _modprobe("ath9k_htc", ["ath9k_common", "ath"])
+
+        else:
+            console_obj.print(f"[red]Unknown install method: {method}[/]")
+
+    except Exception as ex:
+        console_obj.print(f"[red]Install error: {ex}[/]")
+        ok = False
+
+    LED.install_stop()
+
+    if ok:
+        LED.refresh()   # PHY may now be available
+        LED.success()
+    else:
+        LED.error()
+
+    return ok
+
+
+# ── Adapter Info / LED Menu ───────────────────────────────────────────────────
+
+def menu_adapter():
+    """Section A: USB adapter info, driver install, and LED control panel."""
+
+    while True:
+        clear(); banner()
+        console.print("[bold cyan]── Adapter Info / Driver / LED ──[/]\n")
+
+        # Adapter info panel
+        if ADAPTER_CHIPSET:
+            led_badge = "[green]✓ supported[/]" if ADAPTER_LED else "[dim]not supported[/]"
+            info_lines = (
+                f"  [bold]USB ID   :[/] [yellow]{ADAPTER_USB_ID or '?'}[/]\n"
+                f"  [bold]Chipset  :[/] [cyan]{ADAPTER_CHIPSET}[/]\n"
+                f"  [bold]Vendor   :[/] {ADAPTER_VENDOR}\n"
+                f"  [bold]Driver   :[/] [cyan]{ADAPTER_DRIVER}[/]\n"
+                f"  [bold]Method   :[/] {ADAPTER_INSTALL}\n"
+                f"  [bold]LED ctrl :[/] {led_badge}\n"
+                f"  [bold]PHY path :[/] {LED.phy_path or '[dim]not found[/]'}"
+            )
+        else:
+            info_lines = "  [yellow]No adapter detected yet — run [bold]D[/bold] to scan.[/]"
+
+        console.print(Panel(info_lines,
+                            title="[bold yellow]Detected Adapter[/]",
+                            border_style="cyan"))
+
+        # Module load status
+        try:
+            lsmod = subprocess.check_output(["lsmod"], text=True, stderr=subprocess.DEVNULL)
+            loaded = [l.split()[0] for l in lsmod.splitlines()
+                      if any(k in l for k in ("mt76","rt2800","ath9k","r8188","88XX","88x2","8814","8821"))]
+        except Exception:
+            loaded = []
+        mod_str = "  " + "  ".join(f"[green]{m}[/]" for m in loaded) if loaded else "  [dim]none[/]"
+        console.print(f"\n[bold]Loaded wireless modules:[/]\n{mod_str}\n")
+
+        # Options
+        rows = [
+            ("D", "Detect Adapter",          "Scan USB bus and identify chipset",          "cyan"),
+            ("I", "Install Driver",           "Install / compile driver for detected adapter","yellow"),
+            ("L", "List All Adapters (DB)",   "Show full 60+ adapter database",             "dim cyan"),
+            ("", "", "", ""),
+        ]
+        if ADAPTER_LED:
+            rows += [
+                ("1", "LED: Boot Sequence",   "Ramp-up flash pattern",                     "magenta"),
+                ("2", "LED: Scan Pulse",      "Sonar double-ping × 6",                     "magenta"),
+                ("3", "LED: Success",         "Celebration flash → solid ON",               "magenta"),
+                ("4", "LED: Error / SOS",     "SOS morse pattern",                         "magenta"),
+                ("5", "LED: MITM Alert",      "Aggressive strobe → hw-blink",              "magenta"),
+                ("6", "LED: Deauth Blast",    "Machine-gun rapid blink × 15",              "magenta"),
+                ("7", "LED: Monitor Mode",    "Slow heartbeat loop",                       "magenta"),
+                ("8", "LED: Monitor Stop",    "Stop heartbeat loop",                       "magenta"),
+                ("9", "LED: Solid ON",        "Constant on",                               "magenta"),
+                ("0", "LED: OFF",             "Turn LED off",                              "magenta"),
+                ("B", "LED: HW Blink",        "Chip-controlled blink mode",                "magenta"),
+            ]
+
+        tbl = Table(box=box.ROUNDED, border_style="cyan",
+                    show_header=False, padding=(0, 2))
+        tbl.add_column(justify="right", style="bold yellow", width=4)
+        tbl.add_column(style="bold",    width=24)
+        tbl.add_column(style="dim",     width=44)
+
+        for key, name, desc, color in rows:
+            if not key:
+                tbl.add_row("", "[dim]── LED Controls (MT76 only) ──[/]", "")
+            else:
+                tbl.add_row(f"[{color}][{key}][/{color}]",
+                            f"[{color}]{name}[/{color}]", desc)
+
+        tbl.add_row("[dim][Q][/dim]", "[dim]Back[/dim]", "")
+        console.print(tbl)
+
+        ch = Prompt.ask("\n[bold cyan]adapter >[/]").strip().upper()
+
+        if ch == "Q":
+            break
+
+        elif ch == "D":
+            with console.status("[cyan]Scanning USB bus..."):
+                LED.scan_pulse()
+                result = detect_usb_adapter(silent=False)
+            if result:
+                console.print(f"\n[green][✓] Found: [bold]{result['chipset']}[/bold] "
+                               f"({result['vendor']})  USB: {result['usb_id']}[/]")
+                if result["led"]:
+                    console.print("[green][✓] LED control: available[/]")
+            else:
+                console.print("[red][✗] No supported adapter detected.[/]")
+                console.print("[dim]  Check: lsusb | grep -iE '0e8d:|0bda:|148f:|0cf3:'[/]")
+
+        elif ch == "I":
+            if not ADAPTER_CHIPSET:
+                console.print("[red]Run detection (D) first.[/]")
+            elif Confirm.ask(f"[yellow]Install driver for [bold]{ADAPTER_CHIPSET}[/bold] via "
+                             f"[cyan]{ADAPTER_INSTALL}[/cyan]?[/]"):
+                with console.status(f"[cyan]Installing {ADAPTER_DRIVER} driver..."):
+                    ok_flag = install_adapter_driver(console)
+                if ok_flag:
+                    console.print(f"[green][✓] Driver installed — module: {ADAPTER_DRIVER}[/]")
+                else:
+                    console.print(f"[red][✗] Installation failed. Check /tmp for build logs.[/]")
+
+        elif ch == "L":
+            # Full DB table
+            console.print("")
+            db_tbl = Table(box=box.SIMPLE, border_style="cyan", show_header=True)
+            db_tbl.add_column("USB ID",   style="yellow",  width=14)
+            db_tbl.add_column("Chipset",  style="cyan",    width=12)
+            db_tbl.add_column("Vendor",   style="white",   width=22)
+            db_tbl.add_column("Driver",   style="green",   width=14)
+            db_tbl.add_column("Method",   style="magenta", width=16)
+            db_tbl.add_column("LED",      style="bold",    width=5)
+            for uid, (cs, vnd, drv, mth, led) in sorted(ADAPTER_DB.items()):
+                db_tbl.add_row(uid, cs, vnd, drv, mth,
+                               "[green]✓[/]" if led else "[dim]—[/]")
+            console.print(db_tbl)
+
+        # LED commands
+        elif ch == "1": LED.boot_sequence()
+        elif ch == "2": LED.scan_pulse()
+        elif ch == "3": LED.success()
+        elif ch == "4": LED.error()
+        elif ch == "5": LED.mitm_alert()
+        elif ch == "6": LED.deauth_blast()
+        elif ch == "7": LED.monitor_start()
+        elif ch == "8": LED.monitor_stop()
+        elif ch == "9": LED.on();       console.print("[green]LED ON[/]")
+        elif ch == "0": LED.off();      console.print("[dim]LED off[/]")
+        elif ch == "B": LED.hw_blink(); console.print("[yellow]LED: hardware blink[/]")
+        else:
+            console.print("[dim]Unknown option.[/]")
+
+        if ch not in ("Q", "L"):
+            input("\nEnter to continue...")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 3 — UTILITIES
+# ══════════════════════════════════════════════════════════════════════════════
+
+def clear():
+    os.system("clear")
+
+def banner():
+    b = f"""[bold cyan]
+  █████╗ ██╗██████╗      ██╗ █████╗ ██╗██╗
+ ██╔══██╗██║██╔══██╗     ██║██╔══██╗██║██║
+ ███████║██║██████╔╝     ██║███████║██║██║
+ ██╔══██║██║██╔══██╗██   ██║██╔══██║██║██║
+ ██║  ██║██║██║  ██║╚█████╔╝██║  ██║██║███████╗
+ ╚═╝  ╚═╝╚═╝╚═╝  ╚═╝ ╚════╝ ╚═╝  ╚═╝╚═╝╚══════╝[/bold cyan]
+[dim cyan]  WiFi Network Manager & Abuse Control[/dim cyan]
+[bold yellow]  dev: 0xb0rn3 | oxbv1   [dim]{REPO_URL}[/dim][/bold yellow]  [dim]v{VERSION}[/dim]
+"""
+    console.print(b)
+
+def _fmt(b):
+    if b < 1024:        return f"{b} B"
+    if b < 1_048_576:   return f"{b/1024:.1f} KB"
+    if b < 1_073_741_824: return f"{b/1_048_576:.1f} MB"
+    return f"{b/1_073_741_824:.2f} GB"
+
+def get_default_iface():
+    try:
+        out = subprocess.check_output(["ip","route"], text=True)
+        for line in out.splitlines():
+            if line.startswith("default"):
+                return line.split()[line.split().index("dev")+1]
+    except Exception:
+        pass
+    return "wlan0"
+
+def get_gateway():
+    try:
+        out = subprocess.check_output(["ip","route"], text=True)
+        for line in out.splitlines():
+            if line.startswith("default"):
+                gw = line.split()[2]
+                ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=gw),
+                             iface=IFACE, timeout=2, verbose=False)
+                if ans:
+                    return gw, ans[0][1].hwsrc
+                return gw, None
+    except Exception:
+        pass
+    return None, None
+
+def get_local_subnet():
+    try:
+        out = subprocess.check_output(
+            ["ip","-o","-f","inet","addr","show", IFACE], text=True)
+        m = re.search(r"(\d+\.\d+\.\d+\.\d+/\d+)", out)
+        if m: return m.group(1)
+    except Exception:
+        pass
+    return "192.168.1.0/24"
+
+def pick_interface():
+    """Show a numbered interface selection menu and return chosen iface name."""
+    clear(); banner()
+    console.print("[bold cyan]── Select Network Interface ──[/]\n")
+
+    # gather all interfaces with metadata
+    raw_ifaces = []
+    try:
+        out = subprocess.check_output(["ip", "-o", "link", "show"], text=True)
+        for line in out.splitlines():
+            parts  = line.split()
+            idx    = parts[0].rstrip(":")
+            name   = parts[1].rstrip(":")
+            # skip loopback
+            if name == "lo":
+                continue
+            # get IP if any
+            try:
+                ip_out = subprocess.check_output(
+                    ["ip", "-o", "-f", "inet", "addr", "show", name], text=True)
+                m = re.search(r"(\d+\.\d+\.\d+\.\d+/\d+)", ip_out)
+                ip_addr = m.group(1) if m else "no IP"
+            except Exception:
+                ip_addr = "no IP"
+            # get state
+            state_m = re.search(r"state (\S+)", line)
+            state   = state_m.group(1) if state_m else "UNKNOWN"
+            # get MAC
+            mac_m   = re.search(r"link/\S+ ([0-9a-f:]{17})", line)
+            mac     = mac_m.group(1) if mac_m else "—"
+            # is wireless?
+            is_wifi = os.path.exists(f"/sys/class/net/{name}/wireless")
+            if is_wifi and ADAPTER_CHIPSET and ADAPTER_USB_ID:
+                kind = f"[cyan]WiFi[/] [dim yellow]{ADAPTER_CHIPSET}[/]"
+            elif is_wifi:
+                kind = "[cyan]WiFi[/]"
+            else:
+                kind = "[dim]LAN [/]"
+
+            raw_ifaces.append({
+                "name": name, "ip": ip_addr, "mac": mac,
+                "state": state, "kind": kind
+            })
+    except Exception:
+        # fallback: scapy list
+        names = get_if_list() if SCAPY_OK else []
+        raw_ifaces = [{"name": n, "ip": "—", "mac": "—",
+                       "state": "?", "kind": "[dim]—[/]"} for n in names if n != "lo"]
+
+    if not raw_ifaces:
+        console.print("[yellow]No interfaces found. Enter manually.[/]")
+        return Prompt.ask("[cyan]Interface name[/]", default="wlan0")
+
+    table = Table(box=box.ROUNDED, border_style="cyan", show_lines=True)
+    table.add_column("#",       style="bold yellow", width=4, justify="right")
+    table.add_column("Name",    style="bold cyan",   width=12)
+    table.add_column("Type",    width=8)
+    table.add_column("IP / Subnet",   style="green",   width=20)
+    table.add_column("MAC",     style="yellow",  width=20)
+    table.add_column("State",   width=10)
+
+    default_name = get_default_iface()
+    for i, iface in enumerate(raw_ifaces, 1):
+        state_color = "[green]" if "UP" in iface["state"] else "[red]"
+        marker      = " [bold yellow]← default[/]" if iface["name"] == default_name else ""
+        table.add_row(
+            str(i),
+            f"{iface['name']}{marker}",
+            iface["kind"],
+            iface["ip"],
+            iface["mac"],
+            f"{state_color}{iface['state']}[/]"
+        )
+
+    console.print(table)
+    console.print(f"\n[dim]Default auto-detected: [cyan]{default_name}[/][/]\n")
+
+    while True:
+        choice = Prompt.ask(
+            "[bold cyan]Select interface #[/] [dim](or type name directly)[/]"
+        ).strip()
+
+        if choice.isdigit():
+            idx = int(choice)
+            if 1 <= idx <= len(raw_ifaces):
+                selected = raw_ifaces[idx - 1]["name"]
+                console.print(f"\n[green][✓] Interface set → [bold]{selected}[/bold][/]")
+                time.sleep(0.6)
+                return selected
+            else:
+                console.print(f"[red]Enter a number between 1 and {len(raw_ifaces)}[/]")
+        elif choice:
+            # typed name directly
+            console.print(f"\n[green][✓] Interface set → [bold]{choice}[/bold][/]")
+            time.sleep(0.6)
+            return choice
+
+def mac_vendor(mac):
+    if MANUF_OK:
+        try:
+            p = manuf.MacParser()
+            v = p.get_manuf(mac)
+            if v: return v
+        except Exception:
+            pass
+    try:
+        r = requests.get(f"https://api.macvendors.com/{mac}", timeout=3)
+        if r.status_code == 200: return r.text.strip()
+    except Exception:
+        pass
+    return "Unknown"
+
+def hostname_lookup(ip):
+    try: return socket.gethostbyaddr(ip)[0]
+    except Exception: return "—"
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 4 — NETWORK SCAN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def scan_network(subnet=None, silent=False):
+    if not SCAPY_OK:
+        console.print("[red]Scapy unavailable[/]"); return []
+    if subnet is None:
+        subnet = get_local_subnet()
+    if not silent:
+        console.print(f"\n[cyan][*] Scanning {subnet} on [bold]{IFACE}[/bold]...[/]")
+    try:
+        ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=subnet),
+                     iface=IFACE, timeout=3, verbose=False)
+    except Exception as e:
+        console.print(f"[red]Scan error: {e}[/]"); return []
+    return [{"ip": p[ARP].psrc, "mac": p[ARP].hwsrc} for _, p in ans]
+
+def menu_scan():
+    devices = scan_network()
+    if not devices:
+        console.print("[yellow]No devices found.[/]")
+        input("\nEnter to continue..."); return
+
+    table = Table(title="[bold cyan]Network Devices[/]",
+                  box=box.ROUNDED, border_style="cyan", show_lines=True)
+    table.add_column("#",          style="dim",     width=4)
+    table.add_column("IP",         style="green")
+    table.add_column("MAC",        style="yellow")
+    table.add_column("Vendor",     style="magenta")
+    table.add_column("Hostname",   style="blue")
+    table.add_column("BW Used",    style="cyan",  justify="right")
+    table.add_column("Status",     style="bold")
+
+    for i, d in enumerate(devices, 1):
+        vendor   = mac_vendor(d["mac"])
+        hostname = hostname_lookup(d["ip"])
+        jailed   = d["mac"].lower() in JAILED
+        bw       = BW_STATS[d["ip"]]
+        total    = _fmt(bw["rx"] + bw["tx"])
+        status   = "[red]⛔ JAILED[/]" if jailed else "[green]✓ Online[/]"
+        table.add_row(str(i), d["ip"], d["mac"], vendor, hostname, total, status)
+
+    console.print(table)
+    console.print(f"\n[dim]Total: {len(devices)} device(s)[/]")
+    input("\nEnter to continue...")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 5 — DEVICE LOOKUP
+# ══════════════════════════════════════════════════════════════════════════════
+
+def menu_device_lookup():
+    query   = Prompt.ask("[cyan]Enter IP or MAC[/]").strip().lower()
+    devices = scan_network(silent=True)
+
+    found = next(
+        (d for d in devices if query in (d["ip"], d["mac"].lower())), None
+    )
+    if not found:
+        if re.match(r"\d+\.\d+\.\d+\.\d+", query):
+            found = {"ip": query, "mac": "??:??:??:??:??:??"}
+        else:
+            console.print("[red]Device not found.[/]")
+            input("\nEnter to continue..."); return
+
+    vendor   = mac_vendor(found["mac"])
+    hostname = hostname_lookup(found["ip"])
+    jailed   = found["mac"].lower() in JAILED
+    bw       = BW_STATS[found["ip"]]
+    dns_hist = DNS_LOG.get(found["mac"].lower(), [])
+
+    c  = f"[bold]IP        :[/] [green]{found['ip']}[/]\n"
+    c += f"[bold]MAC       :[/] [yellow]{found['mac']}[/]\n"
+    c += f"[bold]Vendor    :[/] [magenta]{vendor}[/]\n"
+    c += f"[bold]Hostname  :[/] [blue]{hostname}[/]\n"
+    c += f"[bold]↓ RX      :[/] [cyan]{_fmt(bw['rx'])}[/]\n"
+    c += f"[bold]↑ TX      :[/] [cyan]{_fmt(bw['tx'])}[/]\n"
+    c += f"[bold]Status    :[/] {'[red]⛔ JAILED[/]' if jailed else '[green]✓ Active[/]'}\n"
+
+    if jailed:
+        j  = JAILED[found["mac"].lower()]
+        c += f"[bold]Reason    :[/] [red]{j.get('reason','—')}[/]\n"
+        c += f"[bold]Jailed At :[/] {j.get('time','—')}\n"
+
+    if dns_hist:
+        c += f"\n[bold]Recent DNS Queries ({len(dns_hist)} total):[/]\n"
+        for d in dns_hist[-15:]:
+            c += f"  [dim cyan]→[/] {escape(d)}\n"
+
+    console.print(Panel(c,
+        title=f"[bold cyan]Device: {found['ip']}[/]",
+        border_style="cyan", box=box.ROUNDED))
+    input("\nEnter to continue...")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 6 — DEAUTH
+# ══════════════════════════════════════════════════════════════════════════════
+
+def deauth_target(target_mac, ap_mac, mon_iface, count=200):
+    pkt = (RadioTap() /
+           Dot11(addr1=target_mac, addr2=ap_mac, addr3=ap_mac) /
+           Dot11Deauth(reason=7))
+    sendp(pkt, iface=mon_iface, count=count, inter=0.05, verbose=False)
+
+def menu_deauth():
+    console.print(Panel(
+        "[yellow]Deauth requires a second USB WiFi adapter in [bold]monitor mode[/bold].\n\n"
+        "[cyan]Setup commands:[/]\n"
+        "  sudo airmon-ng check kill\n"
+        "  sudo airmon-ng start wlan1\n"
+        "  → creates interface [bold]wlan1mon[/bold]\n\n"
+        "[red]⚠  Only use on networks you own or manage.[/red]",
+        title="[bold red]Deauth — Monitor Mode Required[/]",
+        border_style="red"))
+
+    mon_iface  = Prompt.ask("[cyan]Monitor interface (e.g. wlan1mon)[/]")
+    target_mac = Prompt.ask("[cyan]Target MAC[/]")
+    ap_mac     = GATEWAY_MAC or Prompt.ask("[cyan]AP/Gateway MAC[/]")
+    count      = int(Prompt.ask("[cyan]Packet count[/]", default="200"))
+
+    if not Confirm.ask(f"[red]Deauth [bold]{target_mac}[/bold] via {mon_iface}?[/]"):
+        return
+
+    with console.status(f"[red]Sending {count} deauth frames to {target_mac}..."):
+        try:
+            LED.deauth_blast()
+            deauth_target(target_mac, ap_mac, mon_iface, count)
+            JAILED[target_mac.lower()] = {
+                "ip": "—", "reason": "Deauth (manual)",
+                "time": datetime.now().strftime("%H:%M:%S")
+            }
+            console.print(f"[green][✓] Done. {target_mac} deauthed and marked jailed.[/]")
+        except Exception as e:
+            console.print(f"[red]Error: {e}[/]")
+    input("\nEnter to continue...")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 7 — DNS SPY
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _dns_cb(pkt):
+    if pkt.haslayer(DNS) and pkt.haslayer(DNSQR) and pkt[DNS].qr == 0:
+        try:
+            src  = pkt.src.lower() if hasattr(pkt, "src") else "unknown"
+            dom  = pkt[DNSQR].qname.decode(errors="ignore").rstrip(".")
+            if dom and dom not in DNS_LOG[src]:
+                DNS_LOG[src].append(dom)
+                if len(DNS_LOG[src]) > 300:
+                    DNS_LOG[src] = DNS_LOG[src][-300:]
+        except Exception:
+            pass
+
+def start_dns_monitor():
+    if "dns" in _stop_events: return
+    LED.dns_start()
+    ev = threading.Event()
+    _stop_events["dns"] = ev
+    threading.Thread(
+        target=lambda: sniff(iface=IFACE, filter="udp port 53",
+                              prn=_dns_cb, store=False,
+                              stop_filter=lambda _: ev.is_set()),
+        daemon=True
+    ).start()
+
+def menu_dns_spy():
+    if "dns" not in _stop_events:
+        start_dns_monitor()
+
+    while True:
+        clear(); banner()
+        console.print("[bold cyan]── DNS Activity Monitor ──[/]\n")
+
+        if not DNS_LOG:
+            console.print("[yellow]Listening... no queries captured yet. Stay on this screen.[/]")
+        else:
+            table = Table(box=box.ROUNDED, border_style="cyan", show_lines=True,
+                          title="[bold cyan]DNS Queries per Device[/]")
+            table.add_column("MAC",          style="yellow")
+            table.add_column("Queries",      justify="right", style="dim")
+            table.add_column("Latest Domains", style="green")
+
+            for mac, domains in sorted(DNS_LOG.items()):
+                recent = "  ".join(domains[-4:])
+                table.add_row(mac, str(len(domains)), escape(recent))
+
+            console.print(table)
+
+        console.print("\n[dim]  [R] Refresh   [D] Full history for device   [Q] Back[/dim]")
+        ch = Prompt.ask("", default="R").upper()
+
+        if ch == "Q":
+            break
+        elif ch == "D":
+            mac = Prompt.ask("[cyan]MAC address[/]").lower()
+            if mac in DNS_LOG:
+                console.print(f"\n[bold]All DNS queries for {mac}:[/]")
+                for i, d in enumerate(DNS_LOG[mac], 1):
+                    console.print(f"  [dim]{i:>3}.[/] {escape(d)}")
+            else:
+                console.print("[yellow]Not found.[/]")
+            input("\nEnter to continue...")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 8 — BANDWIDTH MONITOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _bw_thread(stop_ev):
+    """Count bytes per client IP using iptables FORWARD chain."""
+    while not stop_ev.is_set():
+        try:
+            out = subprocess.check_output(
+                ["iptables", "-nvxL", "FORWARD"], text=True, stderr=subprocess.DEVNULL)
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) < 10: continue
+                # source IP → TX bytes
+                if re.match(r"\d+\.\d+\.\d+\.\d+", parts[8] if len(parts)>8 else ""):
+                    BW_STATS[parts[8]]["tx"] = int(parts[1])
+                # dest IP → RX bytes
+                if re.match(r"\d+\.\d+\.\d+\.\d+", parts[9] if len(parts)>9 else ""):
+                    BW_STATS[parts[9]]["rx"] = int(parts[1])
+        except Exception:
+            pass
+        time.sleep(2)
+
+def _setup_bw_rules(devices):
+    subprocess.run(["iptables","-F","FORWARD"], check=False, stderr=subprocess.DEVNULL)
+    for d in devices:
+        subprocess.run(["iptables","-A","FORWARD","-s",d["ip"]],
+                       check=False, stderr=subprocess.DEVNULL)
+        subprocess.run(["iptables","-A","FORWARD","-d",d["ip"]],
+                       check=False, stderr=subprocess.DEVNULL)
+
+def menu_bandwidth():
+    devices = scan_network()
+    if not devices:
+        console.print("[yellow]No devices found.[/]")
+        input("\nEnter to continue..."); return
+
+    _setup_bw_rules(devices)
+    dev_map  = {d["ip"]: d["mac"] for d in devices}
+    stop_ev  = threading.Event()
+    _stop_events["bw"] = stop_ev
+    threading.Thread(target=_bw_thread, args=(stop_ev,), daemon=True).start()
+
+    start_ts = datetime.now()
+    console.print("[dim]Press Ctrl+C to exit bandwidth monitor[/]\n")
+
+    try:
+        while True:
+            elapsed = str(timedelta(seconds=int(
+                (datetime.now()-start_ts).total_seconds())))
+
+            table = Table(
+                title=f"[bold cyan]Bandwidth Monitor[/] [dim]uptime {elapsed}[/]",
+                box=box.ROUNDED, border_style="cyan", show_lines=True)
+            table.add_column("IP",    style="green")
+            table.add_column("MAC",   style="yellow")
+            table.add_column("↓ RX",  style="cyan",    justify="right")
+            table.add_column("↑ TX",  style="magenta", justify="right")
+            table.add_column("Total", style="bold",    justify="right")
+            table.add_column("Status",style="bold")
+
+            for ip, mac in dev_map.items():
+                bw     = BW_STATS[ip]
+                total  = bw["rx"] + bw["tx"]
+                jailed = mac.lower() in JAILED
+                status = "[red]⛔ JAILED[/]" if jailed else "[green]✓[/]"
+                table.add_row(ip, mac,
+                              _fmt(bw["rx"]), _fmt(bw["tx"]),
+                              _fmt(total), status)
+
+            console.clear()
+            banner()
+            console.print(table)
+            console.print("\n[dim]Ctrl+C to exit[/]")
+            time.sleep(3)
+
+    except KeyboardInterrupt:
+        stop_ev.set()
+        console.print("\n[yellow][*] Bandwidth monitor stopped.[/]")
+        input("\nEnter to continue...")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 9 — CAPTIVE PORTAL / JAIL / REDIRECT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _redirect_on(target_ip, portal_ip, port=80):
+    subprocess.run(["sysctl","-w","net.ipv4.ip_forward=1"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    cmds = [
+        ["iptables","-t","nat","-A","PREROUTING",
+         "-s",target_ip,"-p","tcp","--dport","80",
+         "-j","DNAT","--to-destination",f"{portal_ip}:{port}"],
+        ["iptables","-t","nat","-A","PREROUTING",
+         "-s",target_ip,"-p","tcp","--dport","443",
+         "-j","DNAT","--to-destination",f"{portal_ip}:{port}"],
+        ["iptables","-A","FORWARD","-s",target_ip,
+         "-p","tcp","!","--dport","80","-j","DROP"],
+    ]
+    for c in cmds:
+        subprocess.run(c, check=False, stderr=subprocess.DEVNULL)
+
+def _redirect_off(target_ip):
+    subprocess.run(["iptables","-t","nat","-F"],
+                   check=False, stderr=subprocess.DEVNULL)
+    subprocess.run(["iptables","-D","FORWARD","-s",target_ip,
+                    "-p","tcp","!","--dport","80","-j","DROP"],
+                   check=False, stderr=subprocess.DEVNULL)
+
+def menu_redirect():
+    global REDIRECT_IP, JAILED
+    while True:
+        clear(); banner()
+        console.print("[bold cyan]── Jail / Redirect / Captive Portal ──[/]\n")
+
+        # current portal status
+        portal_status = (f"[green]{REDIRECT_IP}:{REDIRECT_PORT}[/]"
+                         if REDIRECT_IP else "[red]not configured[/]")
+        console.print(f"  Portal server : {portal_status}")
+        console.print(f"  Jailed users  : [{'red' if JAILED else 'dim'}]{len(JAILED)}[/]\n")
+
+        console.print(
+            "  [bold yellow][1][/] Set / change portal server IP\n"
+            "  [bold red]   [2][/] Jail & redirect a user\n"
+            "  [bold green][3][/] Release user from jail\n"
+            "  [bold cyan]  [4][/] View all jailed users\n"
+            "  [bold magenta][5][/] Release ALL jailed users\n"
+            "  [dim]         [B][/] Back\n"
+        )
+
+        ch = Prompt.ask("[bold cyan]airjail/jail >[/]").upper()
+
+        if ch == "B":
+            break
+
+        elif ch == "1":
+            REDIRECT_IP   = Prompt.ask("[cyan]Portal server IP[/]")
+            REDIRECT_PORT = int(Prompt.ask("[cyan]Port[/]", default="80"))
+            console.print(f"[green][✓] Portal set → {REDIRECT_IP}:{REDIRECT_PORT}[/]")
+
+        elif ch == "2":
+            if not REDIRECT_IP:
+                REDIRECT_IP = Prompt.ask("[yellow]Portal IP not set. Enter now[/]")
+            devices = scan_network(silent=True)
+            if devices:
+                table = Table(box=box.SIMPLE, show_header=False)
+                table.add_column(style="dim", width=3)
+                table.add_column(style="green")
+                table.add_column(style="yellow")
+                for i, d in enumerate(devices, 1):
+                    table.add_row(str(i), d["ip"], d["mac"])
+                console.print(table)
+                idx = Prompt.ask("[cyan]Select device # or enter IP manually[/]")
+                if idx.isdigit() and 1 <= int(idx) <= len(devices):
+                    target_ip  = devices[int(idx)-1]["ip"]
+                    target_mac = devices[int(idx)-1]["mac"]
+                else:
+                    target_ip  = idx
+                    target_mac = next(
+                        (d["mac"] for d in devices if d["ip"]==target_ip), "unknown")
+            else:
+                target_ip  = Prompt.ask("[cyan]Target IP[/]")
+                target_mac = "unknown"
+
+            reason = Prompt.ask("[cyan]Reason[/]", default="Abuse detected")
+            _redirect_on(target_ip, REDIRECT_IP, REDIRECT_PORT)
+            LED.jail_flash()
+            JAILED[target_mac.lower()] = {
+                "ip": target_ip, "reason": reason,
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            console.print(
+                f"[green][✓] {target_ip} ({target_mac}) jailed "
+                f"→ redirected to {REDIRECT_IP}:{REDIRECT_PORT}[/]")
+
+        elif ch == "3":
+            mac = Prompt.ask("[cyan]MAC to release[/]").lower()
+            if mac in JAILED:
+                ip = JAILED[mac].get("ip","")
+                if ip: _redirect_off(ip)
+                LED.unjail_pulse()
+                del JAILED[mac]
+                console.print(f"[green][✓] {mac} released.[/]")
+            else:
+                console.print("[yellow]MAC not in jail.[/]")
+
+        elif ch == "4":
+            if not JAILED:
+                console.print("[yellow]No jailed users.[/]")
+            else:
+                table = Table(title="[bold red]Jailed Users[/]",
+                              box=box.ROUNDED, border_style="red")
+                table.add_column("MAC",    style="yellow")
+                table.add_column("IP",     style="green")
+                table.add_column("Reason", style="red")
+                table.add_column("Time",   style="dim")
+                for mac, info in JAILED.items():
+                    table.add_row(mac, info.get("ip","—"),
+                                  info.get("reason","—"), info.get("time","—"))
+                console.print(table)
+
+        elif ch == "5":
+            if Confirm.ask("[red]Release ALL jailed users?[/]"):
+                for info in JAILED.values():
+                    if info.get("ip"): _redirect_off(info["ip"])
+                JAILED.clear()
+                LED.unjail_pulse()
+                console.print("[green][✓] All users released.[/]")
+
+        if ch != "B":
+            input("\nEnter to continue...")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 10 — FIREWALL STATUS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def menu_firewall():
+    clear(); banner()
+    console.print("[bold cyan]── iptables Firewall Status ──[/]\n")
+    try:
+        out = subprocess.check_output(
+            ["iptables","-nvL","--line-numbers"], text=True)
+        console.print(out)
+        console.print("[bold]NAT table:[/]")
+        out2 = subprocess.check_output(
+            ["iptables","-t","nat","-nvL","--line-numbers"], text=True)
+        console.print(out2)
+    except Exception as e:
+        console.print(f"[red]{e}[/]")
+    input("\nEnter to continue...")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 11 — SETUP
+# ══════════════════════════════════════════════════════════════════════════════
+
+def menu_setup():
+    global IFACE, GATEWAY_IP, GATEWAY_MAC, REDIRECT_IP, REDIRECT_PORT
+
+    IFACE = pick_interface()
+
+    clear(); banner()
+    console.print("[bold cyan]── Setup ──[/]\n")
+    console.print(f"[green][✓] Interface: [bold]{IFACE}[/bold][/]\n")
+
+    with console.status("[cyan]Detecting gateway..."):
+        GATEWAY_IP, GATEWAY_MAC = get_gateway()
+
+    if GATEWAY_IP:
+        console.print(f"[green][✓] Gateway: {GATEWAY_IP}  MAC: {GATEWAY_MAC}[/]")
+    else:
+        GATEWAY_IP  = Prompt.ask("[yellow]Enter gateway IP[/]", default="192.168.1.1")
+        GATEWAY_MAC = Prompt.ask("[yellow]Enter gateway MAC[/]", default="")
+
+    portal = Prompt.ask("[cyan]Captive portal IP (blank to skip)[/]", default="")
+    if portal:
+        REDIRECT_IP   = portal
+        REDIRECT_PORT = int(Prompt.ask("[cyan]Portal port[/]", default="80"))
+
+    if SCAPY_OK:
+        start_dns_monitor()
+        console.print("[green][✓] DNS monitor started.[/]")
+
+    subprocess.run(["sysctl","-w","net.ipv4.ip_forward=1"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    console.print("[green][✓] IP forwarding enabled.[/]")
+
+    console.print(f"""
+[bold green]Setup complete![/]
+  Interface  : [cyan]{IFACE}[/]
+  Gateway    : [cyan]{GATEWAY_IP}  ({GATEWAY_MAC})[/]
+  Portal     : [cyan]{REDIRECT_IP or 'not set'}[/]
+  DNS Monitor: [green]running[/]
+""")
+    input("Enter to continue...")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 12 — MAIN MENU
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main_menu():
+    clear(); banner()
+
+    rows = [
+        ("1", "Network Scan",      "Discover LAN devices — IP, MAC, vendor, hostname",  "green"),
+        ("2", "Device Lookup",     "Deep info + DNS history for any device",             "cyan"),
+        ("3", "Deauth",            "Kick device off WiFi (needs monitor adapter)",       "red"),
+        ("4", "DNS Spy",           "Passively see what sites each user visits",          "yellow"),
+        ("5", "Bandwidth Monitor", "Real-time per-device RX/TX usage",                  "magenta"),
+        ("6", "Jail / Redirect",   "Captive portal redirect & user jail manager",        "bold red"),
+        ("7", "Firewall Status",   "Live iptables rule viewer",                          "dim cyan"),
+        ("8", "Setup",             "Configure interface, gateway & portal",               "blue"),
+        ("A", "Adapter / Driver",  "USB adapter info, driver install & LED control",     "bold magenta"),
+        ("Q", "Quit",              "",                                                    "dim"),
+    ]
+
+    table = Table(box=box.ROUNDED, border_style="cyan",
+                  show_header=False, padding=(0,2))
+    table.add_column(justify="right", style="bold yellow", width=4)
+    table.add_column(style="bold",    width=22)
+    table.add_column(style="dim",     width=50)
+
+    for key, name, desc, color in rows:
+        table.add_row(
+            f"[{color}][{key}][/{color}]",
+            f"[{color}]{name}[/{color}]",
+            desc
+        )
+
+    console.print(table)
+
+    # Status bar — includes adapter chipset and LED state
+    adapter_tag = ""
+    if ADAPTER_CHIPSET:
+        led_tag = " [green]LED[/]" if (ADAPTER_LED and LED._enabled) else ""
+        adapter_tag = f"  adapter:[magenta]{ADAPTER_CHIPSET}[/]{led_tag}"
+    console.print(
+        f"  iface:[cyan]{IFACE}[/]  gw:[cyan]{GATEWAY_IP or '?'}[/]  "
+        f"dns:{'[green]on[/]' if 'dns' in _stop_events else '[red]off[/]'}  "
+        f"jailed:[{'red' if JAILED else 'dim'}]{len(JAILED)}[/]  "
+        f"portal:[cyan]{REDIRECT_IP or 'not set'}[/]{adapter_tag}"
+    )
+    return Prompt.ask("\n[bold cyan]airjail >[/]").strip().upper()
+
+def run():
+    global IFACE, GATEWAY_IP, GATEWAY_MAC
+
+    # ── USB adapter detection (populates globals + fires LED boot) ────────────
+    clear(); banner()
+    with console.status("[cyan]Scanning USB bus for wireless adapter..."):
+        adapter = detect_usb_adapter(silent=True)
+    if adapter:
+        cs_badge  = f"[bold cyan]{adapter['chipset']}[/]"
+        vnd_badge = f"[dim]{adapter['vendor']}[/]"
+        led_badge = "[green]LED ✓[/]" if adapter["led"] else "[dim]no LED[/]"
+        console.print(f"[green][✓] Adapter: {cs_badge}  {vnd_badge}  "
+                      f"USB: [yellow]{adapter['usb_id']}[/]  {led_badge}[/]")
+        LED.boot_sequence()
+    else:
+        console.print("[dim][·] No adapter in database — use [A] Adapter menu to detect/install.[/]")
+
+    # ── first-run interface selection ─────────────────────────────────────────
+    IFACE = pick_interface()
+    clear(); banner()
+    with console.status(f"[cyan]Auto-detecting gateway on {IFACE}..."):
+        GATEWAY_IP, GATEWAY_MAC = get_gateway()
+    if GATEWAY_IP:
+        console.print(f"[green][✓] Gateway: [bold]{GATEWAY_IP}[/bold]  MAC: {GATEWAY_MAC}[/]")
+    else:
+        console.print(f"[yellow][!] Could not auto-detect gateway.[/]")
+        GATEWAY_IP  = Prompt.ask("[cyan]Enter gateway IP[/]", default="192.168.1.1")
+        GATEWAY_MAC = Prompt.ask("[cyan]Enter gateway MAC[/]", default="")
+    if SCAPY_OK:
+        start_dns_monitor()
+        console.print(f"[green][✓] DNS monitor started on {IFACE}[/]")
+    subprocess.run(["sysctl","-w","net.ipv4.ip_forward=1"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    console.print("[green][✓] IP forwarding enabled.[/]")
+    time.sleep(1)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    handlers = {
+        "1": menu_scan,
+        "2": menu_device_lookup,
+        "3": menu_deauth,
+        "4": menu_dns_spy,
+        "5": menu_bandwidth,
+        "6": menu_redirect,
+        "7": menu_firewall,
+        "8": menu_setup,
+        "A": menu_adapter,
+    }
+    while True:
+        ch = main_menu()
+        if ch == "Q":
+            LED.monitor_stop()
+            LED.off()
+            for ev in _stop_events.values(): ev.set()
+            console.print("\n[bold cyan]airjail | 0xb0rn3 — goodbye.[/]\n")
+            sys.exit(0)
+        fn = handlers.get(ch)
+        if fn:
+            fn()
+
+if __name__ == "__main__":
+    run()
