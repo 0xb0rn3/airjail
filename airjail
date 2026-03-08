@@ -11,7 +11,7 @@
 #  WiFi Network Manager & Abuse Control
 #  dev: 0xb0rn3 | oxbv1
 #  github: https://github.com/0xb0rn3/airjail
-#  version: 1.3.0
+#  version: 1.4.0
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -34,7 +34,7 @@ from collections import defaultdict
 #  Runs before any import so missing deps are fixed silently first.
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION    = "1.3.0"
+VERSION    = "1.4.0"
 REPO_URL   = "https://github.com/0xb0rn3/airjail"
 
 # ── system packages needed per distro ────────────────────────────────────────
@@ -225,7 +225,14 @@ REDIRECT_PORT= 80
 IFACE        = None
 GATEWAY_IP   = None
 GATEWAY_MAC  = None
+MON_IFACE    = None    # active monitor-mode interface (wlan1mon etc.)
 _stop_events = {}
+_mon_ifaces  = {}      # iface → original_iface name — active monitor sessions
+_MON_IFACES  = {}      # iface → {"mode", "original"} — monitor sessions this run
+_arp_table   = {}      # ip → mac — ARP change detection across scans
+_mitm_sessions  = {}    # ip → {stop_ev, thread} — active MITM sessions
+MONITOR_IFACES  = {}    # phy → {mon_iface, method, started}
+_scan_results   = []    # alias for _SCAN_CACHE — used by deauth picker
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SECTION 2.5 — USB ADAPTER ENGINE
@@ -996,53 +1003,315 @@ def hostname_lookup(ip):
     except Exception: return "—"
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 #  SECTION 4 — NETWORK SCAN
 # ══════════════════════════════════════════════════════════════════════════════
 
-def scan_network(subnet=None, silent=False):
+# ── TTL → OS heuristic ───────────────────────────────────────────────────────
+def _os_from_ttl(ttl: int) -> str:
+    if   ttl >= 128: return "Windows"
+    elif ttl >=  64: return "Linux/macOS"
+    elif ttl >=  32: return "Network device"
+    else:            return "Unknown"
+
+# ── Signal strength for associated STAs via iw ───────────────────────────────
+def _signal_map() -> dict:
+    """Return {mac_lower: signal_dbm} via `iw dev <IFACE> station dump`."""
+    smap = {}
+    try:
+        out = subprocess.check_output(
+            ["iw", "dev", IFACE, "station", "dump"],
+            text=True, stderr=subprocess.DEVNULL
+        )
+        cur_mac = None
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("Station"):
+                cur_mac = line.split()[1].lower()
+            elif line.startswith("signal:") and cur_mac:
+                m = re.search(r"(-?\d+)", line)
+                if m:
+                    smap[cur_mac] = int(m.group(1))
+    except Exception:
+        pass
+    return smap
+
+# ── Quick port probe for device classification ───────────────────────────────
+_PROBE_PORTS = (22, 23, 80, 443, 554, 8080, 9100)
+
+def _quick_ports(ip: str) -> list:
+    """Non-blocking SYN-connect probe on common ports. Returns sorted open list."""
+    open_ports = []
+    lock = threading.Lock()
+
+    def _probe(p):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(0.35)
+            if s.connect_ex((ip, p)) == 0:
+                with lock: open_ports.append(p)
+            s.close()
+        except Exception:
+            pass
+
+    workers = [threading.Thread(target=_probe, args=(p,), daemon=True)
+               for p in _PROBE_PORTS]
+    for t in workers: t.start()
+    for t in workers: t.join(timeout=0.7)
+    return sorted(open_ports)
+
+# ── Device classification from vendor string + open ports ────────────────────
+def _classify_device(vendor: str, ports: list) -> str:
+    v = vendor.lower()
+    if any(k in v for k in ("raspberry", "arduino")):              return "🍓 IoT/SBC"
+    if "apple" in v:                                               return "🍎 Apple"
+    if any(k in v for k in ("samsung", "xiaomi", "oppo",
+                              "huawei", "oneplus", "realme")):      return "📱 Phone"
+    if any(k in v for k in ("cisco", "ubiquiti", "mikrotik",
+                              "tp-link", "netgear", "asus",
+                              "linksys", "draytek", "edgecore")):   return "🌐 Router/AP"
+    if any(k in v for k in ("canon", "epson", "hp inc", "brother",
+                              "ricoh", "xerox", "kyocera")):        return "🖨 Printer"
+    if 9100 in ports:                                              return "🖨 Printer"
+    if 554  in ports:                                              return "📷 Camera"
+    if 23   in ports:                                              return "🔌 Network"
+    if any(p in ports for p in (22, 80, 443)):                     return "💻 Computer"
+    return "❓ Unknown"
+
+# ── Core scanner: ARP sweep + ICMP ping fallback, threaded ───────────────────
+def scan_network(subnet=None, silent=False) -> list:
+    """
+    Multi-method LAN scanner:
+      1. ARP broadcast sweep (primary — fast, reliable)
+      2. ICMP ping sweep for hosts that ignore ARP (threaded, /24 only)
+      3. TTL-based OS fingerprint (async best-effort)
+      4. ARP-change detection (MitM / rogue device alert)
+    Returns list of dicts: {ip, mac, ttl, os_guess}.
+    """
+    global _arp_table, _scan_results
+
     if not SCAPY_OK:
-        console.print("[red]Scapy unavailable[/]"); return []
+        console.print("[red]Scapy unavailable — cannot scan.[/]"); return []
+
     if subnet is None:
         subnet = get_local_subnet()
     if not silent:
-        console.print(f"\n[cyan][*] Scanning {subnet} on [bold]{IFACE}[/bold]...[/]")
+        console.print(f"\n[cyan][*] Scanning [bold]{subnet}[/bold] on [bold]{IFACE}[/bold]...[/]")
+
+    # ─── 1. ARP sweep ────────────────────────────────────────────────────────
     try:
-        ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=subnet),
-                     iface=IFACE, timeout=3, verbose=False)
+        ans, _ = srp(
+            Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=subnet),
+            iface=IFACE, timeout=3, verbose=False, retry=1
+        )
     except Exception as e:
-        console.print(f"[red]Scan error: {e}[/]"); return []
-    return [{"ip": p[ARP].psrc, "mac": p[ARP].hwsrc} for _, p in ans]
+        if not silent: console.print(f"[red]ARP error: {e}[/]")
+        ans = []
+
+    arp_hosts = {}   # ip → mac_lower
+    for _, pkt in ans:
+        arp_hosts[pkt[ARP].psrc] = pkt[ARP].hwsrc.lower()
+
+    # ─── 2. ICMP ping for non-ARP hosts ─────────────────────────────────────
+    ping_results = {}   # ip → ttl
+
+    try:
+        import ipaddress as _ipmod
+        net   = _ipmod.ip_network(subnet, strict=False)
+        hosts = [str(h) for h in net.hosts()]
+    except Exception:
+        hosts = []
+
+    missed = [h for h in hosts if h not in arp_hosts and len(hosts) <= 512]
+
+    _ping_lock = threading.Lock()
+
+    def _icmp_probe(ip):
+        from scapy.all import IP as _IP, ICMP as _ICMP, sr1 as _sr1
+        try:
+            r = _sr1(_IP(dst=ip)/_ICMP(), timeout=0.8, verbose=False, iface=IFACE)
+            if r and r.haslayer(_IP):
+                with _ping_lock:
+                    ping_results[ip] = r[_IP].ttl
+        except Exception:
+            pass
+
+    if missed:
+        if not silent:
+            console.print(f"[dim]  ICMP probing {len(missed)} non-ARP hosts...[/]")
+        workers = [threading.Thread(target=_icmp_probe, args=(h,), daemon=True)
+                   for h in missed]
+        for t in workers: t.start()
+        for t in workers: t.join(timeout=4.0)
+
+    # ─── 3. ARP-change detection ──────────────────────────────────────────────
+    for ip, mac in arp_hosts.items():
+        prev = _arp_table.get(ip)
+        if prev and prev != mac:
+            console.print(
+                f"\n[bold red][⚠] ARP CHANGE: {ip} was {prev} → now {mac} "
+                f"— possible spoofing![/]"
+            )
+    _arp_table.update(arp_hosts)
+
+    # ─── 4. Build unified result list ─────────────────────────────────────────
+    results  = []
+    seen_ips = set()
+
+    for ip, mac in arp_hosts.items():
+        results.append({"ip": ip, "mac": mac, "ttl": None, "os_guess": ""})
+        seen_ips.add(ip)
+
+    for ip, ttl in ping_results.items():
+        if ip not in seen_ips:
+            results.append({
+                "ip": ip, "mac": "ff:ff:ff:ff:ff:ff",
+                "ttl": ttl, "os_guess": _os_from_ttl(ttl)
+            })
+            seen_ips.add(ip)
+
+    # Fill TTL for ARP hosts (async, best-effort)
+    def _fill_ttl(entry):
+        from scapy.all import IP as _IP, ICMP as _ICMP, sr1 as _sr1
+        try:
+            r = _sr1(_IP(dst=entry["ip"])/_ICMP(), timeout=0.7,
+                     verbose=False, iface=IFACE)
+            if r and r.haslayer(_IP):
+                entry["ttl"]      = r[_IP].ttl
+                entry["os_guess"] = _os_from_ttl(r[_IP].ttl)
+        except Exception:
+            pass
+
+    ttl_workers = [threading.Thread(target=_fill_ttl, args=(e,), daemon=True)
+                   for e in results if e["ttl"] is None]
+    for t in ttl_workers: t.start()
+    for t in ttl_workers: t.join(timeout=3.0)
+
+    _scan_results[:] = results   # keep deauth / port scan pickers in sync
+    return results
+
 
 def menu_scan():
-    devices = scan_network()
+    global MON_IFACE
+
+    with console.status("[cyan]Scanning network..."):
+        devices = scan_network()
+
     if not devices:
         console.print("[yellow]No devices found.[/]")
         input("\nEnter to continue..."); return
 
-    table = Table(title="[bold cyan]Network Devices[/]",
+    smap = _signal_map()
+
+    def _render_table(devs):
+        t = Table(title="[bold cyan]Network Devices[/]",
                   box=box.ROUNDED, border_style="cyan", show_lines=True)
-    table.add_column("#",          style="dim",     width=4)
-    table.add_column("IP",         style="green")
-    table.add_column("MAC",        style="yellow")
-    table.add_column("Vendor",     style="magenta")
-    table.add_column("Hostname",   style="blue")
-    table.add_column("BW Used",    style="cyan",  justify="right")
-    table.add_column("Status",     style="bold")
+        t.add_column("#",       style="dim",     width=4)
+        t.add_column("IP",      style="green",   width=16)
+        t.add_column("MAC",     style="yellow",  width=20)
+        t.add_column("Vendor",  style="magenta", width=18)
+        t.add_column("Device",  style="white",   width=14)
+        t.add_column("OS",      style="cyan",    width=14)
+        t.add_column("Sig",     style="blue",    width=8,  justify="right")
+        t.add_column("BW",      style="cyan",    width=10, justify="right")
+        t.add_column("Status",  style="bold",    width=16)
+        for i, d in enumerate(devs, 1):
+            vendor = mac_vendor(d["mac"])
+            bw     = BW_STATS[d["ip"]]
+            total  = _fmt(bw["rx"] + bw["tx"])
+            sig    = smap.get(d["mac"].lower(), "—")
+            sig_s  = f"{sig}dB" if isinstance(sig, int) else "—"
+            ports  = _quick_ports(d["ip"])
+            dev_c  = _classify_device(vendor, ports)
+            os_g   = d.get("os_guess") or "—"
+            mitm   = d["ip"] in _mitm_sessions
+            jailed = d["mac"].lower() in JAILED
+            if jailed:   status = "[red]⛔ JAILED[/]"
+            elif mitm:   status = "[yellow]🕵 MITM[/]"
+            else:        status = "[green]✓ Online[/]"
+            t.add_row(str(i), d["ip"], d["mac"], vendor,
+                      dev_c, os_g, sig_s, total, status)
+        return t
 
-    for i, d in enumerate(devices, 1):
-        vendor   = mac_vendor(d["mac"])
-        hostname = hostname_lookup(d["ip"])
-        jailed   = d["mac"].lower() in JAILED
-        bw       = BW_STATS[d["ip"]]
-        total    = _fmt(bw["rx"] + bw["tx"])
-        status   = "[red]⛔ JAILED[/]" if jailed else "[green]✓ Online[/]"
-        table.add_row(str(i), d["ip"], d["mac"], vendor, hostname, total, status)
+    console.print(_render_table(devices))
+    console.print(
+        f"\n[dim]Hosts: {len(devices)}  "
+        f"Monitor: [cyan]{MON_IFACE or 'not set'}[/]  "
+        f"Jailed: {len(JAILED)}[/]\n"
+    )
 
-    console.print(table)
-    console.print(f"\n[dim]Total: {len(devices)} device(s)[/]")
-    input("\nEnter to continue...")
+    # ── Interactive post-scan actions ────────────────────────────────────────
+    while True:
+        console.print(
+            "[dim]  [[bold]P[/]]ort-scan  "
+            "[[bold]D[/]]eauth  "
+            "[[bold]J[/]]ail  "
+            "[[bold]M[/]]ITM  "
+            "[[bold]R[/]]escan  "
+            "[[bold]Q[/]]uit[/]"
+        )
+        act = Prompt.ask("[bold cyan]scan >[/]").strip().upper()
 
-# ══════════════════════════════════════════════════════════════════════════════
+        if act == "Q":
+            break
+
+        elif act == "R":
+            with console.status("[cyan]Rescanning..."):
+                devices = scan_network()
+            smap = _signal_map()
+            console.print(_render_table(devices))
+            console.print(f"[green][✓] {len(devices)} hosts[/]\n")
+            continue
+
+        elif act in ("P", "D", "J", "M"):
+            num = Prompt.ask("[cyan]Device # or IP[/]").strip()
+            target = None
+            if num.isdigit():
+                idx = int(num) - 1
+                if 0 <= idx < len(devices):
+                    target = devices[idx]
+            else:
+                target = next((d for d in devices if d["ip"] == num), None)
+            if not target:
+                console.print("[red]Device not found.[/]"); continue
+
+            if act == "P":
+                console.print(f"[cyan]Port scanning {target['ip']}...[/]")
+                _run_nmap(target["ip"])
+
+            elif act == "D":
+                if not MON_IFACE:
+                    console.print(
+                        "[red]No monitor interface set. "
+                        "Use [bold][W] Monitor Mode[/bold] from main menu first.[/]"
+                    )
+                    continue
+                ap  = GATEWAY_MAC or Prompt.ask("[cyan]AP MAC[/]").strip()
+                cnt = int(Prompt.ask("[cyan]Packet count[/]", default="200"))
+                with console.status(f"[red]Deauthing {target['mac']}..."):
+                    LED.deauth_blast()
+                    deauth_target(target["mac"], ap, MON_IFACE, cnt)
+                console.print(f"[green][✓] {cnt} frames → {target['ip']}[/]")
+
+            elif act == "J":
+                reason = Prompt.ask("[cyan]Jail reason[/]", default="Policy violation")
+                if REDIRECT_IP:
+                    _redirect_on(target["ip"], REDIRECT_IP, REDIRECT_PORT)
+                JAILED[target["mac"].lower()] = {
+                    "ip": target["ip"], "reason": reason,
+                    "time": datetime.now().strftime("%H:%M:%S")
+                }
+                LED.jail_flash()
+                session_save()
+                console.print(f"[red][⛔] {target['ip']} jailed.[/]")
+
+            elif act == "M":
+                if Confirm.ask(f"[yellow]Start MITM on {target['ip']}?[/]"):
+                    menu_mitm(target_ip=target["ip"])
+
+        else:
+            console.print("[dim]Unknown action.[/]")
+
 #  SECTION 5 — DEVICE LOOKUP
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1471,6 +1740,7 @@ def menu_setup():
 """)
     input("Enter to continue...")
 
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  SECTION 12 — MAIN MENU
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1488,6 +1758,7 @@ def main_menu():
         ("7", "Firewall Status",   "Live iptables rule viewer",                          "dim cyan"),
         ("8", "Setup",             "Configure interface, gateway & portal",               "blue"),
         ("A", "Adapter / Driver",  "USB adapter info, driver install & LED control",     "bold magenta"),
+        ("M", "Monitor Mode",     "Enable/disable monitor mode, channel control & hop", "yellow"),
         ("Q", "Quit",              "",                                                    "dim"),
     ]
 
@@ -1506,16 +1777,20 @@ def main_menu():
 
     console.print(table)
 
-    # Status bar — includes adapter chipset and LED state
+    # Status bar — includes adapter chipset, LED state, monitor ifaces
     adapter_tag = ""
     if ADAPTER_CHIPSET:
         led_tag = " [green]LED[/]" if (ADAPTER_LED and LED._enabled) else ""
         adapter_tag = f"  adapter:[magenta]{ADAPTER_CHIPSET}[/]{led_tag}"
+    mon_tag = ""
+    if _MON_IFACES:
+        mon_names = ",".join(_MON_IFACES.keys())
+        mon_tag = f"  mon:[red]{mon_names}[/]"
     console.print(
         f"  iface:[cyan]{IFACE}[/]  gw:[cyan]{GATEWAY_IP or '?'}[/]  "
         f"dns:{'[green]on[/]' if 'dns' in _stop_events else '[red]off[/]'}  "
         f"jailed:[{'red' if JAILED else 'dim'}]{len(JAILED)}[/]  "
-        f"portal:[cyan]{REDIRECT_IP or 'not set'}[/]{adapter_tag}"
+        f"portal:[cyan]{REDIRECT_IP or 'not set'}[/]{adapter_tag}{mon_tag}"
     )
     return Prompt.ask("\n[bold cyan]airjail >[/]").strip().upper()
 
@@ -1566,10 +1841,19 @@ def run():
         "7": menu_firewall,
         "8": menu_setup,
         "A": menu_adapter,
+        "M": menu_monitor_mode,
     }
     while True:
         ch = main_menu()
         if ch == "Q":
+            # stop all MITM sessions
+            for ip in list(_mitm_sessions.keys()):
+                _mitm_stop(ip)
+            # stop all monitor mode sessions
+            for phy, sess in list(MONITOR_IFACES.items()):
+                mon = sess.get("mon_iface", phy)
+                _disable_monitor(mon)
+                MONITOR_IFACES.pop(phy, None)
             LED.monitor_stop()
             LED.off()
             for ev in _stop_events.values(): ev.set()
