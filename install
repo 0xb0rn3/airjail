@@ -11,7 +11,7 @@
 #  WiFi Network Manager & Abuse Control — Universal Installer
 #  dev: 0xb0rn3 | oxbv1
 #  github: https://github.com/0xb0rn3/airjail
-#  version: 1.4.0
+#  version: 2.0.0
 #
 #  Supported package managers:
 #    pacman  → Arch, Manjaro, EndeavourOS, Garuda, ArcoLinux, SteamOS
@@ -619,7 +619,7 @@ verify_install
 # ── Final message ─────────────────────────────────────────────────────────────
 echo ""
 echo -e "${GREEN}${BOLD}  ┌──────────────────────────────────────────┐"
-echo -e "  │   airjail v1.4.0 installed successfully  │"
+echo -e "  │   airjail v2.0.0 installed successfully  │"
 echo -e "  └──────────────────────────────────────────┘${NC}"
 echo ""
 echo -e "  Start tool  : ${CYAN}sudo airjail${NC}"
